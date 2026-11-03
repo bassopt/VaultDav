@@ -1,0 +1,54 @@
+# Docker Compose — VaultDAV + Syncthing Stack
+# SQLite (/data/db/vaultdav.sqlite) is used strictly for encrypted credentials.
+# Folders and unencrypted files are mounted directly via .env into both containers.
+
+services:
+  vaultdav:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vaultdav-server
+    restart: unless-stopped
+    ports:
+      - "${WEBDAV_PORT:-8080}:3000"
+    env_file:
+      - .env
+    environment:
+      - ENCRYPT_BRIDGED_FILES=false
+    volumes:
+      - ./data/db:/data/db
+      # Host Folders Exposed via .env (Unencrypted on disk)
+      - ${HOST_PATH_DOCUMENTS:-./host_volumes/documents}:${CONTAINER_PATH_DOCUMENTS:-/var/webdav/documents}:rw
+      - ${HOST_PATH_PROJECTS:-./host_volumes/projects}:${CONTAINER_PATH_PROJECTS:-/var/webdav/projects}:rw
+      - ${HOST_PATH_MEDIA:-./host_volumes/media}:${CONTAINER_PATH_MEDIA:-/var/webdav/media}:rw
+    networks:
+      - vaultdav_net
+
+  syncthing:
+    image: lscr.io/linuxserver/syncthing:latest
+    container_name: vaultdav-syncthing
+    hostname: vaultdav-syncthing
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+    ports:
+      - "${SYNCTHING_GUI_PORT:-8384}:8384"
+      - "${SYNCTHING_SYNC_PORT:-22000}:22000/tcp"
+      - "${SYNCTHING_SYNC_PORT:-22000}:22000/udp"
+      - "21027:21027/udp"
+    volumes:
+      - ./data/syncthing-config:/config
+      # Identical Unencrypted Host Folders Mounted into Syncthing
+      - ${HOST_PATH_DOCUMENTS:-./host_volumes/documents}:${CONTAINER_PATH_DOCUMENTS:-/var/webdav/documents}:rw
+      - ${HOST_PATH_PROJECTS:-./host_volumes/projects}:${CONTAINER_PATH_PROJECTS:-/var/webdav/projects}:rw
+      - ${HOST_PATH_MEDIA:-./host_volumes/media}:${CONTAINER_PATH_MEDIA:-/var/webdav/media}:rw
+    networks:
+      - vaultdav_net
+
+networks:
+  vaultdav_net:
+    driver: bridge

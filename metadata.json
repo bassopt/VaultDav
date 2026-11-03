@@ -1,0 +1,6 @@
+{
+  "name": "VaultDAV — Encrypted SQLite WebDAV & Syncthing Stack",
+  "description": "Self-hosted WebDAV server and Docker Compose controller with AES-256-GCM encrypted credentials over SQLite, .env host folder exposure selector, and Syncthing peer orchestration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

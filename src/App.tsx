@@ -1,0 +1,1542 @@
+import React, { useEffect, useState, useCallback } from 'react';
+import {
+  Download,
+  Plus,
+  Trash2,
+  Copy,
+  Check,
+  LogOut,
+  Folder,
+  FileText,
+  FolderPlus,
+  FilePlus,
+  Upload,
+  RefreshCw,
+  ArrowUp,
+  Save,
+  Sliders,
+  ExternalLink,
+} from 'lucide-react';
+import type {
+  AppStateResponse,
+  AuthStatusResponse,
+  EnvFolderMount,
+  HostBrowserResponse,
+  WebdavCustomHeader,
+  WebdavEntry,
+} from './types';
+
+type ActiveTab = 'folders' | 'webdav_app' | 'syncthing_app' | 'docker';
+type DockerFileKey = 'compose' | 'env' | 'dockerfile' | 'syncthing';
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+}
+
+function parseWebdavPropfindXml(xmlText: string, currentHref: string): WebdavEntry[] {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'application/xml');
+    const responses = Array.from(doc.getElementsByTagNameNS('*', 'response'));
+    const items: WebdavEntry[] = [];
+    const normCurrent = decodeURIComponent(currentHref).replace(/\/+$/, '');
+
+    for (const resp of responses) {
+      const hrefNode = resp.getElementsByTagNameNS('*', 'href')[0];
+      const nameNode = resp.getElementsByTagNameNS('*', 'displayname')[0];
+      const lenNode = resp.getElementsByTagNameNS('*', 'getcontentlength')[0];
+      const modNode = resp.getElementsByTagNameNS('*', 'getlastmodified')[0];
+      const colNode = resp.getElementsByTagNameNS('*', 'collection')[0];
+
+      const rawHref = hrefNode?.textContent || '';
+      const decodedHref = decodeURIComponent(rawHref).replace(/\/+$/, '');
+      if (!rawHref || decodedHref === normCurrent) continue;
+
+      const isDirectory = Boolean(colNode) || rawHref.endsWith('/');
+      const name =
+        nameNode?.textContent ||
+        decodeURIComponent(rawHref.replace(/\/+$/, '').split('/').pop() || '');
+
+      items.push({
+        href: rawHref,
+        name,
+        isDirectory,
+        size: Number(lenNode?.textContent || 0),
+        lastModified: modNode?.textContent || '',
+      });
+    }
+
+    return items.sort((a, b) => {
+      if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  } catch {
+    return [];
+  }
+}
+
+export default function App() {
+  const [sessionToken, setSessionToken] = useState<string>(
+    () => localStorage.getItem('vaultdav_token') || ''
+  );
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authUsername, setAuthUsername] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  const [activeTab, setActiveTab] = useState<ActiveTab>('folders');
+  const [state, setState] = useState<AppStateResponse | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // 1. Small Host Folder Picker state (when adding a new folder to .env)
+  const [showHostBrowser, setShowHostBrowser] = useState<boolean>(false);
+  const [hostBrowserData, setHostBrowserData] = useState<HostBrowserResponse | null>(null);
+  const [hostBrowserLoading, setHostBrowserLoading] = useState<boolean>(false);
+  const [newHostDirName, setNewHostDirName] = useState<string>('');
+  const [newSlug, setNewSlug] = useState('');
+  const [newHostPath, setNewHostPath] = useState('');
+
+  // 2. Real WebDAV File Manager App state
+  const [davAuthed, setDavAuthed] = useState<boolean>(false);
+  const [davLoginUser, setDavLoginUser] = useState<string>('');
+  const [davLoginPass, setDavLoginPass] = useState<string>('');
+  const [davAuthError, setDavAuthError] = useState<string | null>(null);
+  const [davMountSlug, setDavMountSlug] = useState<string>('DOCUMENTS');
+  const [davSubPath, setDavSubPath] = useState<string>('');
+  const [davEntries, setDavEntries] = useState<WebdavEntry[]>([]);
+  const [davLoading, setDavLoading] = useState<boolean>(false);
+  const [davLastHeaders, setDavLastHeaders] = useState<Record<string, string>>({});
+
+  // WebDAV File Viewer / Editor / Creation state
+  const [selectedFile, setSelectedFile] = useState<{ name: string; content: string } | null>(null);
+  const [creatingFolder, setCreatingFolder] = useState<boolean>(false);
+  const [newDavFolderName, setNewDavFolderName] = useState<string>('');
+  const [creatingFile, setCreatingFile] = useState<boolean>(false);
+  const [newDavFileName, setNewDavFileName] = useState<string>('');
+
+  // Simple Custom HTTP Headers inside WebDAV App
+  const [showDavHeadersPanel, setShowDavHeadersPanel] = useState<boolean>(true);
+  const [headerName, setHeaderName] = useState('');
+  const [headerValue, setHeaderValue] = useState('');
+  const [clientHeaderName, setClientHeaderName] = useState('');
+  const [clientHeaderValue, setClientHeaderValue] = useState('');
+
+  // 3. Docker Compose Files Viewer state
+  const [selectedDockerFile, setSelectedDockerFile] = useState<DockerFileKey>('compose');
+
+  const apiFetch = useCallback(
+    (url: string, options: RequestInit = {}) => {
+      return fetch(url, {
+        ...options,
+        headers: {
+          ...(options.headers || {}),
+          'x-session-token': sessionToken,
+        },
+      });
+    },
+    [sessionToken]
+  );
+
+  const loadHostBrowser = useCallback(
+    async (targetPath = './host_volumes') => {
+      setHostBrowserLoading(true);
+      try {
+        const res = await apiFetch(
+          `/api/host-browser?path=${encodeURIComponent(targetPath)}`
+        );
+        if (res.ok) {
+          const data: HostBrowserResponse = await res.json();
+          setHostBrowserData(data);
+        }
+      } catch {
+        // ignore
+      } finally {
+        setHostBrowserLoading(false);
+      }
+    },
+    [apiFetch]
+  );
+
+  const checkAuthAndLoad = useCallback(async () => {
+    try {
+      const statusRes = await fetch('/api/auth/status', {
+        headers: { 'x-session-token': sessionToken },
+      });
+      const statusData: AuthStatusResponse = await statusRes.json();
+      setAuthStatus(statusData);
+
+      if (statusData.authenticated) {
+        const stateRes = await apiFetch('/api/state');
+        if (stateRes.ok) {
+          const data: AppStateResponse = await stateRes.json();
+          setState(data);
+          setDavLoginUser((prev) => prev || data.account.username);
+          const firstExposed = data.folders.find((f) => f.exposed);
+          if (firstExposed) {
+            setDavMountSlug((prev) =>
+              data.folders.some((f) => f.slug === prev && f.exposed)
+                ? prev
+                : firstExposed.slug
+            );
+          }
+        }
+      } else {
+        setState(null);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionToken, apiFetch]);
+
+  useEffect(() => {
+    checkAuthAndLoad();
+  }, [checkAuthAndLoad]);
+
+  // Perform real WebDAV request with Basic Auth + optional custom client header
+  const fetchWebdav = useCallback(
+    async (
+      pathUrl: string,
+      method: string,
+      body?: string,
+      overrideUser?: string,
+      overridePass?: string
+    ) => {
+      const user = overrideUser !== undefined ? overrideUser : davLoginUser;
+      const pass = overridePass !== undefined ? overridePass : davLoginPass;
+      const headers: Record<string, string> = {
+        Authorization: `Basic ${btoa(`${user}:${pass}`)}`,
+      };
+      if (method === 'PROPFIND') {
+        headers['Depth'] = '1';
+      }
+      if (clientHeaderName.trim() && clientHeaderValue.trim()) {
+        headers[clientHeaderName.trim()] = clientHeaderValue.trim();
+      }
+
+      const res = await fetch(pathUrl, {
+        method,
+        headers,
+        body,
+      });
+
+      const capturedHeaders: Record<string, string> = {};
+      res.headers.forEach((v, k) => {
+        capturedHeaders[k] = v;
+      });
+      setDavLastHeaders(capturedHeaders);
+      return res;
+    },
+    [davLoginUser, davLoginPass, clientHeaderName, clientHeaderValue]
+  );
+
+  const loadWebdavDirectory = useCallback(
+    async (slug = davMountSlug, sub = davSubPath, user?: string, pass?: string) => {
+      if (!slug) return false;
+      setDavLoading(true);
+      setDavAuthError(null);
+      try {
+        const cleanSub = sub.replace(/^\/+|\/+$/g, '');
+        const encodedSub = cleanSub
+          ? cleanSub
+              .split('/')
+              .map((s) => encodeURIComponent(s))
+              .join('/') + '/'
+          : '';
+        const href = `/dav/${slug.toLowerCase()}/${encodedSub}`;
+        const res = await fetchWebdav(href, 'PROPFIND', undefined, user, pass);
+
+        if (res.status === 401) {
+          setDavAuthed(false);
+          setDavAuthError('Invalid WebDAV login or password');
+          return false;
+        }
+        if (!res.ok && res.status !== 207) {
+          const errText = await res.text();
+          setDavAuthError(errText || `WebDAV Error (${res.status})`);
+          return false;
+        }
+
+        const xml = await res.text();
+        const parsed = parseWebdavPropfindXml(xml, href);
+        setDavEntries(parsed);
+        setDavAuthed(true);
+        return true;
+      } catch (err: any) {
+        setDavAuthError(err.message || 'Failed to connect to WebDAV server');
+        return false;
+      } finally {
+        setDavLoading(false);
+      }
+    },
+    [davMountSlug, davSubPath, fetchWebdav]
+  );
+
+  useEffect(() => {
+    if (activeTab === 'webdav_app' && davAuthed) {
+      loadWebdavDirectory(davMountSlug, davSubPath);
+    }
+  }, [activeTab, davAuthed, davMountSlug, davSubPath, loadWebdavDirectory]);
+
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authUsername.trim() || !authPassword) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+
+    const endpoint = authStatus?.hasAccount ? '/api/auth/login' : '/api/auth/setup';
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: authUsername.trim(),
+          password: authPassword,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Authentication failed');
+      } else {
+        localStorage.setItem('vaultdav_token', data.token);
+        setSessionToken(data.token);
+        setDavLoginUser(authUsername.trim());
+        setDavLoginPass(authPassword);
+        setDavAuthed(true);
+        setAuthPassword('');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Network error');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await apiFetch('/api/auth/logout', { method: 'POST' });
+    localStorage.removeItem('vaultdav_token');
+    setSessionToken('');
+    setState(null);
+    setDavAuthed(false);
+    setDavLoginPass('');
+    setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, username: null } : null));
+  };
+
+  const handleCopy = (id: string, text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 1600);
+  };
+
+  // =========================================================================
+  // HOST FOLDERS (.ENV) & INLINE FOLDER BROWSER ACTIONS
+  // =========================================================================
+  const handleToggleFolder = async (
+    folder: EnvFolderMount,
+    field: 'exposed' | 'syncthing_enabled'
+  ) => {
+    await apiFetch(`/api/folders/${folder.slug}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [field]: !folder[field] }),
+    });
+    await checkAuthAndLoad();
+  };
+
+  const handleAddFolder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newSlug.trim()) return;
+    const res = await apiFetch('/api/folders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        slug: newSlug.trim(),
+        host_path: newHostPath.trim(),
+      }),
+    });
+    if (res.ok) {
+      setNewSlug('');
+      setNewHostPath('');
+      await checkAuthAndLoad();
+    }
+  };
+
+  const handleCreateHostDirectoryInBrowser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newHostDirName.trim() || !hostBrowserData) return;
+    const res = await apiFetch('/api/host-browser/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        parentPath: hostBrowserData.relativePath,
+        name: newHostDirName.trim(),
+      }),
+    });
+    if (res.ok) {
+      const created = await res.json();
+      setNewHostDirName('');
+      await loadHostBrowser(hostBrowserData.relativePath);
+      if (created.relativePath) {
+        setNewHostPath(created.relativePath);
+        if (!newSlug.trim() && created.name) {
+          setNewSlug(String(created.name).toUpperCase().replace(/[^A-Z0-9_]/g, '_'));
+        }
+      }
+    }
+  };
+
+  const handleDeleteFolder = async (slug: string) => {
+    await apiFetch(`/api/folders/${slug}`, { method: 'DELETE' });
+    await checkAuthAndLoad();
+  };
+
+  // =========================================================================
+  // REAL WEBDAV FILE MANAGER APP ACTIONS
+  // =========================================================================
+  const handleWebdavLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await loadWebdavDirectory(davMountSlug, davSubPath, davLoginUser, davLoginPass);
+  };
+
+  const buildDavTargetUrl = (itemName?: string, isDir = false) => {
+    const cleanSub = davSubPath.replace(/^\/+|\/+$/g, '');
+    const parts = cleanSub ? cleanSub.split('/') : [];
+    if (itemName) parts.push(itemName);
+    const encoded = parts.map((p) => encodeURIComponent(p)).join('/');
+    return `/dav/${davMountSlug.toLowerCase()}/${encoded}${isDir && encoded ? '/' : ''}`;
+  };
+
+  const handleOpenDavEntry = async (entry: WebdavEntry) => {
+    if (entry.isDirectory) {
+      const nextSub = davSubPath ? `${davSubPath}/${entry.name}` : entry.name;
+      setSelectedFile(null);
+      setDavSubPath(nextSub);
+      return;
+    }
+
+    const res = await fetchWebdav(buildDavTargetUrl(entry.name), 'GET');
+    if (res.ok) {
+      const content = await res.text();
+      setSelectedFile({ name: entry.name, content });
+    }
+  };
+
+  const handleSaveDavFile = async () => {
+    if (!selectedFile) return;
+    const res = await fetchWebdav(
+      buildDavTargetUrl(selectedFile.name),
+      'PUT',
+      selectedFile.content
+    );
+    if (res.ok) {
+      await loadWebdavDirectory();
+      await checkAuthAndLoad();
+    }
+  };
+
+  const handleCreateDavFile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newDavFileName.trim()) return;
+    const fileName = newDavFileName.trim();
+    const initialContent = `# ${fileName}\n\n`;
+    const res = await fetchWebdav(buildDavTargetUrl(fileName), 'PUT', initialContent);
+    if (res.ok) {
+      setNewDavFileName('');
+      setCreatingFile(false);
+      await loadWebdavDirectory();
+      await checkAuthAndLoad();
+      setSelectedFile({ name: fileName, content: initialContent });
+    }
+  };
+
+  const handleCreateDavFolder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newDavFolderName.trim()) return;
+    const res = await fetchWebdav(buildDavTargetUrl(newDavFolderName.trim(), true), 'MKCOL');
+    if (res.ok) {
+      setNewDavFolderName('');
+      setCreatingFolder(false);
+      await loadWebdavDirectory();
+      await checkAuthAndLoad();
+    }
+  };
+
+  const handleDeleteDavEntry = async (entry: WebdavEntry) => {
+    const res = await fetchWebdav(buildDavTargetUrl(entry.name, entry.isDirectory), 'DELETE');
+    if (res.ok || res.status === 204) {
+      if (selectedFile?.name === entry.name) {
+        setSelectedFile(null);
+      }
+      await loadWebdavDirectory();
+      await checkAuthAndLoad();
+    }
+  };
+
+  const handleUploadDavFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    const res = await fetchWebdav(buildDavTargetUrl(file.name), 'PUT', text);
+    if (res.ok) {
+      await loadWebdavDirectory();
+      await checkAuthAndLoad();
+    }
+    e.target.value = '';
+  };
+
+  // =========================================================================
+  // SIMPLE CUSTOM HTTP HEADERS (FOR WEBDAV ONLY)
+  // =========================================================================
+  const handleAddCustomHeader = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!headerName.trim() || !headerValue.trim()) return;
+    const res = await apiFetch('/api/headers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        header_name: headerName.trim(),
+        header_value: headerValue.trim(),
+      }),
+    });
+    if (res.ok) {
+      setHeaderName('');
+      setHeaderValue('');
+      await checkAuthAndLoad();
+      if (davAuthed) {
+        await loadWebdavDirectory();
+      }
+    }
+  };
+
+  const handleToggleHeader = async (index: number, header: WebdavCustomHeader) => {
+    await apiFetch(`/api/headers/${index}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !header.enabled }),
+    });
+    await checkAuthAndLoad();
+    if (davAuthed) {
+      await loadWebdavDirectory();
+    }
+  };
+
+  const handleDeleteHeader = async (index: number) => {
+    await apiFetch(`/api/headers/${index}`, { method: 'DELETE' });
+    await checkAuthAndLoad();
+    if (davAuthed) {
+      await loadWebdavDirectory();
+    }
+  };
+
+  const handleDownloadSingleFile = (filename: string, content: string) => {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadStack = () => {
+    if (!state) return;
+    const bundle = [
+      '# --- FILE: docker-compose.yml ---',
+      state.artifacts.composeContent,
+      '',
+      '# --- FILE: .env ---',
+      state.artifacts.envContent,
+      '',
+      '# --- FILE: Dockerfile ---',
+      state.artifacts.dockerfileContent,
+      '',
+      '# --- FILE: data/syncthing-config/config.xml ---',
+      state.artifacts.syncthingXmlContent,
+    ].join('\n');
+    handleDownloadSingleFile('vaultdav-docker-compose-bundle.txt', bundle);
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#050507] text-zinc-100 flex items-center justify-center">
+        <div className="text-sm font-mono text-zinc-400">Loading...</div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // LOGIN OR INITIAL SINGLE-ACCOUNT CREATION PROMPT
+  // =========================================================================
+  if (!authStatus?.authenticated || !state) {
+    const isSetupMode = !authStatus?.hasAccount;
+    return (
+      <div className="min-h-screen bg-[#050507] text-zinc-100 flex items-center justify-center p-6">
+        <div className="max-w-sm w-full bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-5">
+          <h1 className="text-xl font-bold tracking-tight text-zinc-100">
+            {isSetupMode ? 'Create Account' : 'Sign In'}
+          </h1>
+
+          {authError && (
+            <div className="p-3 bg-red-950/60 border border-red-800 rounded-md text-xs text-red-300">
+              {authError}
+            </div>
+          )}
+
+          <form onSubmit={handleAuthSubmit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-zinc-300 mb-1">Username</label>
+              <input
+                type="text"
+                required
+                autoFocus
+                placeholder="admin"
+                value={authUsername}
+                onChange={(e) => setAuthUsername(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-zinc-300 mb-1">Password</label>
+              <input
+                type="password"
+                required
+                placeholder="••••••••••••"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full py-2.5 px-4 text-xs font-semibold bg-blue-600 text-white rounded-md hover:bg-blue-500 transition-colors"
+            >
+              {authSubmitting
+                ? 'Verifying...'
+                : isSetupMode
+                ? 'Create Account'
+                : 'Sign In'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  const getDockerFileDetails = (key: DockerFileKey) => {
+    switch (key) {
+      case 'compose':
+        return { filename: 'docker-compose.yml', content: state.artifacts.composeContent };
+      case 'env':
+        return { filename: '.env', content: state.artifacts.envContent };
+      case 'dockerfile':
+        return { filename: 'Dockerfile', content: state.artifacts.dockerfileContent };
+      case 'syncthing':
+        return { filename: 'config.xml', content: state.artifacts.syncthingXmlContent };
+    }
+  };
+
+  const activeDockerFile = getDockerFileDetails(selectedDockerFile);
+  const exposedFolders = state.folders.filter((f) => f.exposed);
+
+  return (
+    <div className="min-h-screen bg-[#050507] text-zinc-100 flex flex-col">
+      {/* Top Bar Contract: 3 zones separated by gap-8 */}
+      <header className="flex items-center justify-between gap-8 px-8 py-4 bg-[#0c0d10] border-b border-zinc-800/80 sticky top-0 z-20">
+        <a
+          href="#top"
+          onClick={(e) => {
+            e.preventDefault();
+            setActiveTab('folders');
+          }}
+          className="text-lg font-bold tracking-tight text-zinc-100 whitespace-nowrap shrink-0"
+        >
+          VaultDAV
+        </a>
+
+        <nav className="flex items-center gap-6 text-sm font-medium text-zinc-400 overflow-x-auto">
+          <button
+            onClick={() => setActiveTab('folders')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeTab === 'folders'
+                ? 'border-blue-500 text-zinc-100 font-semibold'
+                : 'border-transparent hover:text-zinc-200'
+            }`}
+          >
+            Host Folders (.env)
+          </button>
+          <button
+            onClick={() => setActiveTab('webdav_app')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeTab === 'webdav_app'
+                ? 'border-blue-500 text-zinc-100 font-semibold'
+                : 'border-transparent hover:text-zinc-200'
+            }`}
+          >
+            WebDAV App
+          </button>
+          <button
+            onClick={() => setActiveTab('syncthing_app')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeTab === 'syncthing_app'
+                ? 'border-blue-500 text-zinc-100 font-semibold'
+                : 'border-transparent hover:text-zinc-200'
+            }`}
+          >
+            Syncthing App
+          </button>
+          <button
+            onClick={() => setActiveTab('docker')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+              activeTab === 'docker'
+                ? 'border-blue-500 text-zinc-100 font-semibold'
+                : 'border-transparent hover:text-zinc-200'
+            }`}
+          >
+            Docker Compose Files
+          </button>
+        </nav>
+
+        <div className="flex items-center shrink-0">
+          <button
+            onClick={handleDownloadStack}
+            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Download Docker Bundle
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-[1140px] w-full mx-auto px-8 py-6 space-y-6 flex-1">
+        {/* Quick App Access Bar */}
+        <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg px-5 py-3 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-2 text-xs font-mono text-zinc-300">
+            <span>Signed in as:</span>
+            <strong className="text-zinc-100">{state.account.username}</strong>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              onClick={() => setActiveTab('webdav_app')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+                activeTab === 'webdav_app'
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-blue-600 text-white hover:bg-blue-500'
+              }`}
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              Access WebDAV App
+            </button>
+
+            <button
+              onClick={() => setActiveTab('syncthing_app')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+                activeTab === 'syncthing_app'
+                  ? 'bg-zinc-800 text-white border border-zinc-700'
+                  : 'bg-zinc-900 text-zinc-200 hover:bg-zinc-800 border border-zinc-800'
+              }`}
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              Access Syncthing App
+            </button>
+
+            <button
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-zinc-800 rounded-md whitespace-nowrap"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              Sign Out
+            </button>
+          </div>
+        </section>
+
+        {/* ===================================================================
+            TAB 1: HOST FOLDERS (.ENV) WITH SMALL FOLDER PICKER ON ADD FORM
+           =================================================================== */}
+        {activeTab === 'folders' && (
+          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-5">
+            <div>
+              <h2 className="text-base font-semibold text-zinc-100">
+                Exposed Host Folders (.env)
+              </h2>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Configured in <code className="font-mono">.env</code> and shared between WebDAV and Syncthing.
+              </p>
+            </div>
+
+            <div className="divide-y divide-zinc-800/80">
+              {state.folders.map((folder) => (
+                <div
+                  key={folder.slug}
+                  className="py-3.5 first:pt-0 last:pb-0 flex items-center justify-between gap-4"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-zinc-100">{folder.slug}</span>
+                      <span className="text-xs text-zinc-600">·</span>
+                      <code className="text-xs font-mono text-zinc-400 truncate">
+                        {folder.host_path} → {folder.container_path}
+                      </code>
+                    </div>
+                    <div className="text-xs text-zinc-500 font-mono tabular-nums mt-0.5">
+                      {folder.env_expose_key}={folder.exposed ? 'true' : 'false'} ·{' '}
+                      {folder.fileCount} file(s) ({formatBytes(folder.totalBytes)})
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => {
+                        setDavMountSlug(folder.slug);
+                        setDavSubPath('');
+                        setActiveTab('webdav_app');
+                      }}
+                      className="px-2.5 py-1.5 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md"
+                    >
+                      Open DAV
+                    </button>
+
+                    <button
+                      onClick={() => handleToggleFolder(folder, 'exposed')}
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        folder.exposed
+                          ? 'bg-blue-600 text-white hover:bg-blue-500'
+                          : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 border border-zinc-800'
+                      }`}
+                    >
+                      {folder.exposed ? 'Exposed' : 'Hidden'}
+                    </button>
+
+                    <button
+                      onClick={() => handleToggleFolder(folder, 'syncthing_enabled')}
+                      className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        folder.syncthing_enabled && folder.exposed
+                          ? 'bg-zinc-900 text-blue-400 border border-blue-500/40'
+                          : 'bg-zinc-900/60 text-zinc-500 hover:text-zinc-300 border border-zinc-800/80'
+                      }`}
+                    >
+                      Syncthing {folder.syncthing_enabled ? 'On' : 'Off'}
+                    </button>
+
+                    <button
+                      onClick={() => handleDeleteFolder(folder.slug)}
+                      className="p-1.5 text-zinc-500 hover:text-red-400 rounded-md"
+                      title="Remove from .env"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Add Folder to .env Form with Small Folder Browser Picker */}
+            <div className="pt-4 border-t border-zinc-800/80 space-y-3">
+              <form
+                onSubmit={(e) => {
+                  handleAddFolder(e);
+                  setShowHostBrowser(false);
+                }}
+                className="flex flex-col sm:flex-row gap-2"
+              >
+                <input
+                  type="text"
+                  required
+                  placeholder="Folder Name (e.g. BACKUPS)"
+                  value={newSlug}
+                  onChange={(e) => setNewSlug(e.target.value)}
+                  className="sm:w-48 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+                />
+
+                <div className="flex-1 flex gap-1.5">
+                  <input
+                    type="text"
+                    placeholder="Host path (click Browse to choose or create folder)"
+                    value={newHostPath}
+                    onChange={(e) => setNewHostPath(e.target.value)}
+                    className="flex-1 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !showHostBrowser;
+                      setShowHostBrowser(next);
+                      if (next && !hostBrowserData) {
+                        loadHostBrowser('./host_volumes');
+                      }
+                    }}
+                    className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors shrink-0 ${
+                      showHostBrowser
+                        ? 'bg-blue-600/20 text-blue-300 border-blue-500/40'
+                        : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border-zinc-800'
+                    }`}
+                  >
+                    <Folder className="w-3.5 h-3.5" />
+                    Browse...
+                  </button>
+                </div>
+
+                <button
+                  type="submit"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 text-white rounded-md hover:bg-blue-500 whitespace-nowrap shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add to .env
+                </button>
+              </form>
+
+              {/* Small Inline Host Folder Picker (with option to create a new folder) */}
+              {showHostBrowser && (
+                <div className="p-3 bg-[#050507] border border-zinc-800 rounded-md space-y-2.5 max-w-xl">
+                  <div className="flex items-center justify-between gap-2 text-xs font-mono">
+                    <span className="text-zinc-400 truncate">
+                      Path:{' '}
+                      <strong className="text-blue-400">
+                        {hostBrowserData?.relativePath || './host_volumes'}
+                      </strong>
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {hostBrowserData?.parentPath && (
+                        <button
+                          type="button"
+                          onClick={() => loadHostBrowser(hostBrowserData.parentPath!)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded"
+                        >
+                          <ArrowUp className="w-3 h-3" />
+                          Up
+                        </button>
+                      )}
+                      {hostBrowserData && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const rel = hostBrowserData.relativePath;
+                            const dirName = rel.split('/').pop() || 'SHARE';
+                            setNewHostPath(rel);
+                            if (!newSlug.trim() && dirName !== '.' && dirName !== 'host_volumes') {
+                              setNewSlug(dirName.toUpperCase().replace(/[^A-Z0-9_]/g, '_'));
+                            }
+                            setShowHostBrowser(false);
+                          }}
+                          className="px-2 py-0.5 bg-blue-600 text-white font-sans font-semibold rounded hover:bg-blue-500"
+                        >
+                          Use Current Path
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="divide-y divide-zinc-800/70 max-h-44 overflow-y-auto border border-zinc-900 rounded">
+                    {hostBrowserLoading ? (
+                      <div className="p-2.5 text-xs font-mono text-zinc-500">
+                        Loading folders...
+                      </div>
+                    ) : (
+                      hostBrowserData?.entries
+                        .filter((e) => e.isDirectory)
+                        .map((entry) => (
+                          <div
+                            key={entry.relativePath}
+                            className="px-2.5 py-1.5 flex items-center justify-between gap-2 hover:bg-zinc-900/70"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => loadHostBrowser(entry.relativePath)}
+                              className="flex items-center gap-2 text-xs font-mono text-zinc-200 hover:text-blue-400 truncate text-left"
+                            >
+                              <Folder className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                              <span className="truncate">{entry.name}/</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setNewHostPath(entry.relativePath);
+                                if (!newSlug.trim()) {
+                                  setNewSlug(
+                                    entry.name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+                                  );
+                                }
+                                setShowHostBrowser(false);
+                              }}
+                              className="px-2 py-0.5 text-[11px] font-semibold bg-zinc-900 hover:bg-blue-600 hover:text-white text-zinc-200 border border-zinc-800 rounded shrink-0 transition-colors"
+                            >
+                              Select
+                            </button>
+                          </div>
+                        ))
+                    )}
+                  </div>
+
+                  {/* Option to create a new folder directly inside the .env file browser */}
+                  <form
+                    onSubmit={handleCreateHostDirectoryInBrowser}
+                    className="flex gap-1.5 pt-1"
+                  >
+                    <input
+                      type="text"
+                      placeholder="New folder name..."
+                      value={newHostDirName}
+                      onChange={(e) => setNewHostDirName(e.target.value)}
+                      className="flex-1 px-2.5 py-1 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+                    />
+                    <button
+                      type="submit"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded shrink-0"
+                    >
+                      <FolderPlus className="w-3.5 h-3.5" />
+                      New Folder
+                    </button>
+                  </form>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ===================================================================
+            TAB 2: REAL INTERACTIVE WEBDAV FILE MANAGER APP + SIMPLE CUSTOM HEADERS
+           =================================================================== */}
+        {activeTab === 'webdav_app' && (
+          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg overflow-hidden">
+            {/* WebDAV App Header Bar */}
+            <div className="px-6 py-4 border-b border-zinc-800/80 flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold text-zinc-100">
+                  WebDAV File Manager (/dav/{davMountSlug.toLowerCase()}/)
+                </h2>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowDavHeadersPanel((v) => !v)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
+                    showDavHeadersPanel
+                      ? 'bg-blue-600/20 text-blue-300 border-blue-500/50'
+                      : 'bg-zinc-900 text-zinc-200 border-zinc-800 hover:bg-zinc-800'
+                  }`}
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  Custom Headers ({state.customHeaders.filter((h) => h.enabled).length})
+                </button>
+              </div>
+            </div>
+
+            {/* Simple Collapsible Custom HTTP Headers Bar (Strictly for WebDAV Features) */}
+            {showDavHeadersPanel && (
+              <div className="px-6 py-4 bg-[#07080a] border-b border-zinc-800/80 space-y-4">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* Server Response Custom Headers (.env) */}
+                  <div className="space-y-2.5">
+                    <div className="text-xs font-semibold text-zinc-200">
+                      WebDAV Response Headers (.env)
+                    </div>
+                    {state.customHeaders.length > 0 && (
+                      <div className="space-y-1.5">
+                        {state.customHeaders.map((hdr, idx) => (
+                          <div
+                            key={`${hdr.header_name}-${idx}`}
+                            className="flex items-center justify-between gap-2 px-3 py-1.5 bg-[#0c0d10] border border-zinc-800 rounded text-xs font-mono"
+                          >
+                            <div className="truncate">
+                              <span className="text-zinc-200">{hdr.header_name}: </span>
+                              <span className="text-blue-400">{hdr.header_value}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                onClick={() => handleToggleHeader(idx, hdr)}
+                                className={`px-2 py-0.5 text-[11px] rounded ${
+                                  hdr.enabled
+                                    ? 'bg-blue-600 text-white font-semibold'
+                                    : 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                                }`}
+                              >
+                                {hdr.enabled ? 'On' : 'Off'}
+                              </button>
+                              <button
+                                onClick={() => handleDeleteHeader(idx)}
+                                className="text-zinc-500 hover:text-red-400"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <form onSubmit={handleAddCustomHeader} className="flex gap-2">
+                      <input
+                        type="text"
+                        required
+                        placeholder="Header Name"
+                        value={headerName}
+                        onChange={(e) => setHeaderName(e.target.value)}
+                        className="w-1/2 px-2.5 py-1.5 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100"
+                      />
+                      <input
+                        type="text"
+                        required
+                        placeholder="Header Value"
+                        value={headerValue}
+                        onChange={(e) => setHeaderValue(e.target.value)}
+                        className="flex-1 px-2.5 py-1.5 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100"
+                      />
+                      <button
+                        type="submit"
+                        className="px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500 shrink-0"
+                      >
+                        Add
+                      </button>
+                    </form>
+                  </div>
+
+                  {/* Client Request Header & Live WebDAV Response Header Inspector */}
+                  <div className="space-y-2.5">
+                    <div className="text-xs font-semibold text-zinc-200">
+                      Client Request Header &amp; Last Response Headers
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Request Header (e.g. X-Client-ID)"
+                        value={clientHeaderName}
+                        onChange={(e) => setClientHeaderName(e.target.value)}
+                        className="w-1/2 px-2.5 py-1.5 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Request Value"
+                        value={clientHeaderValue}
+                        onChange={(e) => setClientHeaderValue(e.target.value)}
+                        className="w-1/2 px-2.5 py-1.5 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100"
+                      />
+                    </div>
+                    <div className="p-2.5 bg-[#0c0d10] border border-zinc-800 rounded text-[11px] font-mono text-zinc-400 max-h-28 overflow-y-auto space-y-0.5">
+                      {Object.keys(davLastHeaders).length === 0 ? (
+                        <div>Perform any WebDAV action to view response headers.</div>
+                      ) : (
+                        Object.entries(davLastHeaders).map(([k, v]) => (
+                          <div key={k}>
+                            <span className="text-zinc-300">{k}:</span>{' '}
+                            <span className="text-blue-400">{v}</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* WebDAV Basic Auth Login Prompt */}
+            {!davAuthed ? (
+              <div className="p-8 flex justify-center">
+                <form
+                  onSubmit={handleWebdavLogin}
+                  className="max-w-sm w-full bg-[#050507] border border-zinc-800 rounded-lg p-6 space-y-4"
+                >
+                  <h3 className="text-base font-semibold text-zinc-100">
+                    Sign In to WebDAV
+                  </h3>
+
+                  {davAuthError && (
+                    <div className="p-2.5 bg-red-950/60 border border-red-800 rounded text-xs text-red-300">
+                      {davAuthError}
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-xs text-zinc-300 mb-1">Username</label>
+                    <input
+                      type="text"
+                      required
+                      value={davLoginUser}
+                      onChange={(e) => setDavLoginUser(e.target.value)}
+                      className="w-full px-3 py-2 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-zinc-300 mb-1">Password</label>
+                    <input
+                      type="password"
+                      required
+                      autoFocus
+                      placeholder="••••••••••••"
+                      value={davLoginPass}
+                      onChange={(e) => setDavLoginPass(e.target.value)}
+                      className="w-full px-3 py-2 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full py-2 px-4 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500"
+                  >
+                    Sign In
+                  </button>
+                </form>
+              </div>
+            ) : (
+              /* Real Authenticated WebDAV File Manager UI */
+              <div className="grid grid-cols-1 md:grid-cols-12 min-h-[480px]">
+                {/* Left Sidebar: Exposed .env Mounts */}
+                <aside className="md:col-span-3 border-r border-zinc-800/80 bg-[#07080a] p-4 space-y-3">
+                  <div className="text-xs font-mono uppercase tracking-wider text-zinc-500">
+                    Mounts
+                  </div>
+                  <div className="space-y-1">
+                    {exposedFolders.map((f) => (
+                      <button
+                        key={f.slug}
+                        onClick={() => {
+                          setDavMountSlug(f.slug);
+                          setDavSubPath('');
+                          setSelectedFile(null);
+                        }}
+                        className={`w-full px-3 py-2 rounded-md text-left text-xs font-mono flex items-center justify-between transition-colors ${
+                          davMountSlug === f.slug
+                            ? 'bg-blue-600 text-white font-semibold'
+                            : 'text-zinc-300 hover:bg-zinc-900'
+                        }`}
+                      >
+                        <span className="truncate">/dav/{f.slug.toLowerCase()}/</span>
+                        <span className="text-[11px] opacity-80">{f.fileCount}</span>
+                      </button>
+                    ))}
+                  </div>
+                </aside>
+
+                {/* Right Main Area: WebDAV Directory Browser + File Editor */}
+                <div className="md:col-span-9 p-5 flex flex-col justify-between space-y-4">
+                  <div className="space-y-4">
+                    {/* Path Bar + File Operations Toolbar */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-zinc-800/80">
+                      <div className="flex items-center gap-2 text-xs font-mono text-zinc-200">
+                        {davSubPath && (
+                          <button
+                            onClick={() => {
+                              const parts = davSubPath.split('/').filter(Boolean);
+                              parts.pop();
+                              setDavSubPath(parts.join('/'));
+                              setSelectedFile(null);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-1 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded text-zinc-200"
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" />
+                            Up
+                          </button>
+                        )}
+                        <span className="text-blue-400">
+                          /dav/{davMountSlug.toLowerCase()}/{davSubPath ? `${davSubPath}/` : ''}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={() => {
+                            setCreatingFile((v) => !v);
+                            setCreatingFolder(false);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md"
+                        >
+                          <FilePlus className="w-3.5 h-3.5" />
+                          New File
+                        </button>
+
+                        <button
+                          onClick={() => {
+                            setCreatingFolder((v) => !v);
+                            setCreatingFile(false);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md"
+                        >
+                          <FolderPlus className="w-3.5 h-3.5" />
+                          New Folder
+                        </button>
+
+                        <label className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md cursor-pointer">
+                          <Upload className="w-3.5 h-3.5" />
+                          Upload
+                          <input
+                            type="file"
+                            onChange={handleUploadDavFile}
+                            className="hidden"
+                          />
+                        </label>
+
+                        <button
+                          onClick={() => loadWebdavDirectory()}
+                          className="p-1.5 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-zinc-800 rounded-md"
+                          title="Refresh"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Inline Create File or Folder Input */}
+                    {creatingFile && (
+                      <form onSubmit={handleCreateDavFile} className="flex gap-2">
+                        <input
+                          type="text"
+                          required
+                          autoFocus
+                          placeholder="New filename (e.g. notes.md)"
+                          value={newDavFileName}
+                          onChange={(e) => setNewDavFileName(e.target.value)}
+                          className="flex-1 px-3 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded text-zinc-100"
+                        />
+                        <button
+                          type="submit"
+                          className="px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500"
+                        >
+                          Create
+                        </button>
+                      </form>
+                    )}
+
+                    {creatingFolder && (
+                      <form onSubmit={handleCreateDavFolder} className="flex gap-2">
+                        <input
+                          type="text"
+                          required
+                          autoFocus
+                          placeholder="New directory name"
+                          value={newDavFolderName}
+                          onChange={(e) => setNewDavFolderName(e.target.value)}
+                          className="flex-1 px-3 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded text-zinc-100"
+                        />
+                        <button
+                          type="submit"
+                          className="px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500"
+                        >
+                          Create
+                        </button>
+                      </form>
+                    )}
+
+                    {/* WebDAV Directory Table */}
+                    <div className="bg-[#050507] border border-zinc-800 rounded-lg divide-y divide-zinc-800/80">
+                      {davLoading ? (
+                        <div className="p-6 text-xs font-mono text-zinc-500">
+                          Loading...
+                        </div>
+                      ) : davEntries.length === 0 ? (
+                        <div className="p-6 text-xs font-mono text-zinc-500">
+                          No files in this folder yet.
+                        </div>
+                      ) : (
+                        davEntries.map((entry) => (
+                          <div
+                            key={entry.href}
+                            className="px-4 py-2.5 flex items-center justify-between gap-4 hover:bg-zinc-900/60 transition-colors"
+                          >
+                            <button
+                              onClick={() => handleOpenDavEntry(entry)}
+                              className="flex items-center gap-2.5 min-w-0 text-left flex-1"
+                            >
+                              {entry.isDirectory ? (
+                                <Folder className="w-4 h-4 text-blue-400 shrink-0" />
+                              ) : (
+                                <FileText className="w-4 h-4 text-zinc-400 shrink-0" />
+                              )}
+                              <span className="text-xs font-mono text-zinc-100 hover:text-blue-400 truncate">
+                                {entry.name}
+                                {entry.isDirectory ? '/' : ''}
+                              </span>
+                            </button>
+
+                            <div className="flex items-center gap-4 shrink-0 text-xs font-mono text-zinc-500 tabular-nums">
+                              {!entry.isDirectory && <span>{formatBytes(entry.size)}</span>}
+                              <button
+                                onClick={() => handleDeleteDavEntry(entry)}
+                                className="text-zinc-500 hover:text-red-400"
+                                title="Delete"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+
+                    {/* Built-in File Editor (GET / PUT) */}
+                    {selectedFile && (
+                      <div className="p-4 bg-[#050507] border border-zinc-800 rounded-lg space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-mono font-semibold text-blue-400">
+                            {selectedFile.name}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() =>
+                                handleDownloadSingleFile(selectedFile.name, selectedFile.content)
+                              }
+                              className="px-2.5 py-1 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded"
+                            >
+                              Download
+                            </button>
+                            <button
+                              onClick={handleSaveDavFile}
+                              className="inline-flex items-center gap-1 px-3 py-1 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500"
+                            >
+                              <Save className="w-3.5 h-3.5" />
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                        <textarea
+                          rows={5}
+                          value={selectedFile.content}
+                          onChange={(e) =>
+                            setSelectedFile({ ...selectedFile, content: e.target.value })
+                          }
+                          className="w-full p-3 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ===================================================================
+            TAB 3: NATIVE SYNCTHING APP (LIVE OFFICIAL BINARY ON :8384)
+           =================================================================== */}
+        {activeTab === 'syncthing_app' && (
+          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg overflow-hidden">
+            <div className="px-6 py-3.5 border-b border-zinc-800/80 flex items-center justify-between">
+              <h2 className="text-base font-semibold text-zinc-100">
+                Syncthing
+              </h2>
+              <button
+                onClick={() => setActiveTab('folders')}
+                className="px-3 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md"
+              >
+                Host Folders (.env)
+              </button>
+            </div>
+            <iframe
+              src={state.syncthingUrl}
+              title="Native Syncthing Web GUI"
+              className="w-full h-[640px] border-0 bg-[#050507]"
+            />
+          </section>
+        )}
+
+        {/* ===================================================================
+            TAB 4: DOCKER COMPOSE & RELATED FILES VIEWER
+           =================================================================== */}
+        {activeTab === 'docker' && (
+          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-zinc-800/80">
+              <div>
+                <h2 className="text-base font-semibold text-zinc-100">
+                  Docker Compose Files
+                </h2>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1 p-1 bg-[#050507] border border-zinc-800 rounded-lg">
+                <button
+                  onClick={() => setSelectedDockerFile('compose')}
+                  className={`px-3 py-1.5 text-xs font-mono font-medium rounded-md transition-colors ${
+                    selectedDockerFile === 'compose'
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  docker-compose.yml
+                </button>
+                <button
+                  onClick={() => setSelectedDockerFile('env')}
+                  className={`px-3 py-1.5 text-xs font-mono font-medium rounded-md transition-colors ${
+                    selectedDockerFile === 'env'
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  .env
+                </button>
+                <button
+                  onClick={() => setSelectedDockerFile('dockerfile')}
+                  className={`px-3 py-1.5 text-xs font-mono font-medium rounded-md transition-colors ${
+                    selectedDockerFile === 'dockerfile'
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Dockerfile
+                </button>
+                <button
+                  onClick={() => setSelectedDockerFile('syncthing')}
+                  className={`px-3 py-1.5 text-xs font-mono font-medium rounded-md transition-colors ${
+                    selectedDockerFile === 'syncthing'
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  syncthing/config.xml
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-xs font-mono text-zinc-400">
+              <span>File: {activeDockerFile.filename}</span>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => handleCopy('docker-file', activeDockerFile.content)}
+                  className="inline-flex items-center gap-1.5 text-zinc-300 hover:text-white"
+                >
+                  {copiedId === 'docker-file' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-blue-400" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      Copy File
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={() =>
+                    handleDownloadSingleFile(
+                      activeDockerFile.filename,
+                      activeDockerFile.content
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 text-blue-400 hover:text-blue-300"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download {activeDockerFile.filename}
+                </button>
+              </div>
+            </div>
+
+            <pre className="p-4 bg-[#050507] border border-zinc-800 text-zinc-200 rounded-lg text-xs font-mono overflow-x-auto max-h-[480px] leading-relaxed">
+              {activeDockerFile.content}
+            </pre>
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
