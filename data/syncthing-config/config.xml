@@ -1,0 +1,25 @@
+<configuration version="37">
+    <folder id="host-volumes" label="Host Volumes (/var/webdav)" path="/var/webdav" type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="true" fsWatcherDelayS="2" ignorePerms="false" autoNormalize="true">
+        <filesystemType>basic</filesystemType>
+        <minDiskFree unit="%">1</minDiskFree>
+        <markerName>.stfolder</markerName>
+    </folder>
+    <gui enabled="true" tls="false" debugging="false" sendBasicAuthPrompt="false">
+        <address>0.0.0.0:8384</address>
+        <apikey>vaultdav-syncthing-local-api-key</apikey>
+        <theme>dark</theme>
+        <insecureSkipHostcheck>true</insecureSkipHostcheck>
+        <insecureAdminAccess>true</insecureAdminAccess>
+    </gui>
+    <options>
+        <listenAddress>default</listenAddress>
+        <globalAnnounceEnabled>true</globalAnnounceEnabled>
+        <localAnnounceEnabled>true</localAnnounceEnabled>
+        <relaysEnabled>true</relaysEnabled>
+        <natEnabled>true</natEnabled>
+        <startBrowser>false</startBrowser>
+        <urAccepted>-1</urAccepted>
+        <autoUpgradeIntervalH>0</autoUpgradeIntervalH>
+        <crashReportingEnabled>false</crashReportingEnabled>
+    </options>
+</configuration>

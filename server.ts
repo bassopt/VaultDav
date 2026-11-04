@@ -15,27 +15,56 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 process.env.DISABLE_HMR = 'true';
 
-const DATA_DIR = path.join(__dirname, 'data', 'db');
-const SYNCTHING_HOME_DIR = path.join(__dirname, 'data', 'syncthing-home');
-const SYNCTHING_BIN = path.join(__dirname, 'bin', 'syncthing');
-const HOST_VOLUMES_DIR = path.join(__dirname, 'host_volumes');
-const ENV_STACK_FILE = path.join(__dirname, 'data', '.env.stack');
-const STATIC_ZIP_FILE = path.join(__dirname, 'vaultdav-docker-compose.zip');
+// Canonical paths
+const DATA_DIR = process.env.SQLITE_DB_PATH
+  ? path.dirname(process.env.SQLITE_DB_PATH)
+  : path.join(__dirname, 'data', 'db');
+const DB_PATH = process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'vaultdav.sqlite');
 
+const HOST_VOLUMES_DIR = process.env.HOST_VOLUMES_DIR
+  ? path.resolve(process.env.HOST_VOLUMES_DIR)
+  : path.join(__dirname, 'host_volumes');
+
+const SYNCTHING_CONFIG_DIR = path.join(__dirname, 'data', 'syncthing-config');
+const SYNCTHING_CONFIG_FILE = path.join(SYNCTHING_CONFIG_DIR, 'config.xml');
+const RUNTIME_SYNCTHING_DIR = '/tmp/vaultdav-syncthing-runtime';
+const SYNCTHING_BIN = fs.existsSync('/tmp/vaultdav-runtime/bin/syncthing')
+  ? '/tmp/vaultdav-runtime/bin/syncthing'
+  : path.join(__dirname, 'bin', 'syncthing');
+
+const ENV_STACK_FILE = path.join(__dirname, 'data', '.env.stack');
+
+// Ensure directories exist
 fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(SYNCTHING_HOME_DIR, { recursive: true });
 fs.mkdirSync(HOST_VOLUMES_DIR, { recursive: true });
+fs.mkdirSync(SYNCTHING_CONFIG_DIR, { recursive: true });
+fs.mkdirSync(RUNTIME_SYNCTHING_DIR, { recursive: true });
+
+// Ensure default host volume subfolders
+const initialSubfolders = ['documents', 'projects', 'media', 'photos', 'backups'];
+for (const sub of initialSubfolders) {
+  const p = path.join(HOST_VOLUMES_DIR, sub);
+  fs.mkdirSync(p, { recursive: true });
+  const readmePath = path.join(p, `${sub}-readme.md`);
+  if (!fs.existsSync(readmePath)) {
+    fs.writeFileSync(
+      readmePath,
+      `# ${sub.toUpperCase()} Folder\n\nShared unencrypted inside \`./host_volumes/${sub}\` and bridged between WebDAV and Syncthing.\n`,
+      'utf8'
+    );
+  }
+}
 
 // ============================================================================
 // 1. SQLITE DATABASE: STRICTLY & EXCLUSIVELY FOR ENCRYPTED CREDENTIALS
 // ============================================================================
-const DB_PATH = path.join(DATA_DIR, 'vaultdav.sqlite');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 const MASTER_SECRET = process.env.SQLITE_MASTER_KEY || 'vaultdav-aes256-gcm-master-secret-key-2026';
 const KDF_SALT = 'vaultdav-sqlite-kdf-salt-v1';
 const SYNCTHING_API_KEY = 'vaultdav-syncthing-local-api-key';
+const SYNCTHING_TARGET_URL = process.env.SYNCTHING_URL || 'http://127.0.0.1:8384';
 
 const activeSessions = new Map<string, { username: string; createdAt: number }>();
 
@@ -69,7 +98,6 @@ function decryptSecret(ciphertextHex: string, ivHex: string, authTagHex: string,
   return decrypted.toString('utf8');
 }
 
-// Cryptographically safe password generator for WebDAV (alphanumeric + safe symbols, no colon ':')
 function generateSafeWebdavPassword(length = 24): string {
   const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
   const lower = 'abcdefghijkmnopqrstuvwxyz';
@@ -103,21 +131,8 @@ function generateSafeWebdavPassword(length = 24): string {
   return chars.join('');
 }
 
-// Ensure credentials table exists in SQLite
-const existingCols = db.prepare("PRAGMA table_info(credentials)").all() as { name: string }[];
-if (existingCols.length > 0 && !existingCols.some((c) => c.name === 'totp_ciphertext_hex')) {
-  db.exec('DROP TABLE IF EXISTS credentials;');
-}
-
+// Database tables
 db.exec(`
-  DROP TABLE IF EXISTS exposed_folders;
-  DROP TABLE IF EXISTS webdav_custom_headers;
-  DROP TABLE IF EXISTS syncthing_devices;
-  DROP TABLE IF EXISTS syncthing_block_events;
-  DROP TABLE IF EXISTS webdav_audit_logs;
-  DROP TABLE IF EXISTS stack_settings;
-  DROP TABLE IF EXISTS webdav_credentials;
-
   CREATE TABLE IF NOT EXISTS credentials (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     username TEXT NOT NULL UNIQUE,
@@ -131,84 +146,64 @@ db.exec(`
     webdav_ciphertext_hex TEXT NOT NULL DEFAULT '',
     webdav_iv_hex TEXT NOT NULL DEFAULT '',
     webdav_auth_tag_hex TEXT NOT NULL DEFAULT '',
-    kdf_spec TEXT NOT NULL DEFAULT 'PBKDF2-SHA256 (100k) -> AES-256-GCM + TOTP',
+    kdf_spec TEXT NOT NULL DEFAULT 'PBKDF2-HMAC-SHA256 (100,000 iter) -> AES-256-GCM',
     created_at TEXT NOT NULL,
     last_used_at TEXT
   );
 `);
 
-// Add columns if migrating an older database
-const currentCols = db.prepare("PRAGMA table_info(credentials)").all() as { name: string }[];
-if (!currentCols.some((c) => c.name === 'totp_enabled')) {
-  db.exec(`
-    ALTER TABLE credentials ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0;
-  `);
+function ensureWebdavCredentialsInSqlite() {
+  const row = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
+  if (row && (!row.webdav_ciphertext_hex || !row.webdav_iv_hex || !row.webdav_auth_tag_hex)) {
+    const safePassword = generateSafeWebdavPassword(24);
+    const encDav = encryptSecret(safePassword);
+    db.prepare(`
+      UPDATE credentials
+      SET webdav_ciphertext_hex = ?, webdav_iv_hex = ?, webdav_auth_tag_hex = ?
+      WHERE id = 1
+    `).run(encDav.ciphertextHex, encDav.ivHex, encDav.authTagHex);
+  }
 }
-if (!currentCols.some((c) => c.name === 'webdav_ciphertext_hex')) {
-  db.exec(`
-    ALTER TABLE credentials ADD COLUMN webdav_ciphertext_hex TEXT NOT NULL DEFAULT '';
-    ALTER TABLE credentials ADD COLUMN webdav_iv_hex TEXT NOT NULL DEFAULT '';
-    ALTER TABLE credentials ADD COLUMN webdav_auth_tag_hex TEXT NOT NULL DEFAULT '';
-  `);
+ensureWebdavCredentialsInSqlite();
+
+// TOTP (RFC 6238)
+function generateBase32Secret(length = 20): string {
+  const bytes = crypto.randomBytes(length);
+  let secret = '';
+  for (let i = 0; i < length; i++) {
+    secret += BASE32_ALPHABET[bytes[i] % 32];
+  }
+  return secret;
 }
 
-// Auto-populate initial safe WebDAV password into SQLite if missing
-const existingAccountRow = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
-if (existingAccountRow && !existingAccountRow.webdav_ciphertext_hex) {
-  const autoDavPass = generateSafeWebdavPassword(24);
-  const encDav = encryptSecret(autoDavPass);
-  db.prepare(`
-    UPDATE credentials
-    SET webdav_ciphertext_hex = ?, webdav_iv_hex = ?, webdav_auth_tag_hex = ?
-    WHERE id = 1
-  `).run(encDav.ciphertextHex, encDav.ivHex, encDav.authTagHex);
-}
-
-function generateBase32Secret(byteLength = 20): string {
-  const buf = crypto.randomBytes(byteLength);
+function base32ToBuffer(base32: string): Buffer {
+  const cleaned = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
   let bits = 0;
   let value = 0;
-  let output = '';
-  for (let i = 0; i < buf.length; i++) {
-    value = (value << 8) | buf[i];
-    bits += 8;
-    while (bits >= 5) {
-      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-  }
-  if (bits > 0) {
-    output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
-  }
-  return output;
-}
+  const output: number[] = [];
 
-function decodeBase32(base32: string): Buffer {
-  const clean = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
-  let bits = 0;
-  let value = 0;
-  const bytes: number[] = [];
-  for (let i = 0; i < clean.length; i++) {
-    const idx = BASE32_ALPHABET.indexOf(clean[i]);
+  for (let i = 0; i < cleaned.length; i++) {
+    const idx = BASE32_ALPHABET.indexOf(cleaned[i]);
     if (idx === -1) continue;
     value = (value << 5) | idx;
     bits += 5;
     if (bits >= 8) {
-      bytes.push((value >>> (bits - 8)) & 0xff);
+      output.push((value >>> (bits - 8)) & 0xff);
       bits -= 8;
     }
   }
-  return Buffer.from(bytes);
+  return Buffer.from(output);
 }
 
-function generateTotpAtCounter(base32Secret: string, counter: number): string {
-  const key = decodeBase32(base32Secret);
+function generateTotpAtCounter(secretBase32: string, counter: number, digits = 6): string {
+  const key = base32ToBuffer(secretBase32);
   const buf = Buffer.alloc(8);
   let tmp = counter;
   for (let i = 7; i >= 0; i--) {
     buf[i] = tmp & 0xff;
     tmp = Math.floor(tmp / 256);
   }
+
   const hmac = crypto.createHmac('sha1', key).update(buf).digest();
   const offset = hmac[hmac.length - 1] & 0x0f;
   const code =
@@ -216,119 +211,98 @@ function generateTotpAtCounter(base32Secret: string, counter: number): string {
       ((hmac[offset + 1] & 0xff) << 16) |
       ((hmac[offset + 2] & 0xff) << 8) |
       (hmac[offset + 3] & 0xff)) %
-    1000000;
-  return String(code).padStart(6, '0');
+    Math.pow(10, digits);
+
+  return code.toString().padStart(digits, '0');
 }
 
-function verifyTotpCode(base32Secret: string, token: string, windowSteps = 1): boolean {
-  const cleanToken = String(token || '').replace(/\s+/g, '');
+function verifyTotpCode(secretBase32: string, token: string, windowSteps = 1): boolean {
+  const cleanToken = (token || '').trim().replace(/\s+/g, '');
   if (!/^\d{6}$/.test(cleanToken)) return false;
+
   const currentCounter = Math.floor(Date.now() / 1000 / 30);
-  for (let w = -windowSteps; w <= windowSteps; w++) {
-    if (generateTotpAtCounter(base32Secret, currentCounter + w) === cleanToken) {
+  for (let errorWindow = -windowSteps; errorWindow <= windowSteps; errorWindow++) {
+    const expected = generateTotpAtCounter(secretBase32, currentCounter + errorWindow);
+    if (expected === cleanToken) {
       return true;
     }
   }
   return false;
 }
 
-function verifyMainAppCredentials(
-  username: string,
-  password: string,
-  totpCode?: string
-): { ok: boolean; account?: any; error?: string } {
-  const row = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
-  if (!row) {
-    return { ok: false, error: 'No account exists in SQLite yet. Create the single account first.' };
-  }
-  if (row.username !== username) {
+function verifyMainAppCredentials(username: string, plainPassword: string, totpCode?: string): { ok: boolean; error?: string } {
+  const row = db
+    .prepare(
+      'SELECT id, username, ciphertext_hex, iv_hex, auth_tag_hex, totp_ciphertext_hex, totp_iv_hex, totp_auth_tag_hex, totp_enabled FROM credentials WHERE id = 1'
+    )
+    .get() as any;
+  if (!row || row.username !== username) {
     return { ok: false, error: 'Invalid username or password' };
   }
   try {
-    const decryptedPassword = decryptSecret(row.ciphertext_hex, row.iv_hex, row.auth_tag_hex);
-    const passBuf = Buffer.from(password, 'utf8');
-    const decBuf = Buffer.from(decryptedPassword, 'utf8');
-    if (passBuf.length !== decBuf.length || !crypto.timingSafeEqual(passBuf, decBuf)) {
+    const decryptedPass = decryptSecret(row.ciphertext_hex, row.iv_hex, row.auth_tag_hex);
+    const a = Buffer.from(plainPassword, 'utf8');
+    const b = Buffer.from(decryptedPass, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return { ok: false, error: 'Invalid username or password' };
     }
 
-    // Check if TOTP 2FA is enabled for this account
-    const isTotpEnabled = Boolean(row.totp_enabled && row.totp_ciphertext_hex && row.totp_ciphertext_hex.trim() !== '');
-    if (isTotpEnabled) {
-      if (!totpCode || !totpCode.trim()) {
-        return { ok: false, error: '6-digit TOTP 2FA code is required for this account' };
+    const isTotpActive = Boolean(row.totp_enabled && row.totp_ciphertext_hex && row.totp_iv_hex && row.totp_auth_tag_hex);
+    if (isTotpActive) {
+      if (!totpCode) {
+        return { ok: false, error: '6-digit TOTP 2FA code is required' };
       }
-      const decryptedTotpSecret = decryptSecret(
-        row.totp_ciphertext_hex,
-        row.totp_iv_hex,
-        row.totp_auth_tag_hex
-      );
-      if (!verifyTotpCode(decryptedTotpSecret, String(totpCode || ''))) {
+      const decryptedTotpSecret = decryptSecret(row.totp_ciphertext_hex, row.totp_iv_hex, row.totp_auth_tag_hex);
+      if (!verifyTotpCode(decryptedTotpSecret, totpCode)) {
         return { ok: false, error: 'Invalid 6-digit TOTP 2FA code' };
       }
     }
 
     db.prepare('UPDATE credentials SET last_used_at = ? WHERE id = 1').run(new Date().toISOString());
-    return { ok: true, account: row };
+    return { ok: true };
   } catch {
-    return { ok: false, error: 'Failed to decrypt SQLite credential' };
+    return { ok: false, error: 'Decryption error verifying credentials' };
   }
 }
 
-// WebDAV Basic Auth: The username MUST be the SAME username used for login!
-// Password is the auto-generated safe password (or login password) stored encrypted in SQLite.
-function verifyWebdavBasicAuth(
-  authHeader: string | undefined
-): { ok: boolean; username: string; error?: string } {
-  if (!authHeader || !authHeader.startsWith('Basic ')) {
-    return { ok: false, username: 'anonymous', error: 'WebDAV username and safe password required' };
-  }
-  const decoded = Buffer.from(authHeader.slice(6).trim(), 'base64').toString('utf8');
-  const colonIdx = decoded.indexOf(':');
-  if (colonIdx === -1) {
-    return { ok: false, username: 'invalid', error: 'Malformed Basic Auth header' };
-  }
-  const username = decoded.slice(0, colonIdx);
-  const password = decoded.slice(colonIdx + 1);
-
+function verifyWebdavBasicAuth(authHeader?: string): { ok: boolean; username?: string; error?: string } {
   const row = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
   if (!row) {
-    return { ok: false, username, error: 'No account configured in SQLite yet' };
+    return { ok: false, error: 'Account not initialized in SQLite' };
   }
 
-  // 1. Username MUST match the login username
-  if (username !== row.username) {
-    return { ok: false, username, error: `Invalid WebDAV username. Must match login username (${row.username})` };
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    return { ok: false, error: 'WebDAV Basic Authentication required' };
   }
 
   try {
-    const passBuf = Buffer.from(password, 'utf8');
+    const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+    const colonIdx = decoded.indexOf(':');
+    if (colonIdx === -1) return { ok: false, error: 'Malformed Basic Auth header' };
 
-    // 2. Check the safe auto-generated password stored encrypted in SQLite
-    if (row.webdav_ciphertext_hex) {
-      const decryptedDavPass = decryptSecret(
-        row.webdav_ciphertext_hex,
-        row.webdav_iv_hex,
-        row.webdav_auth_tag_hex
-      );
-      const decDavBuf = Buffer.from(decryptedDavPass, 'utf8');
-      if (passBuf.length === decDavBuf.length && crypto.timingSafeEqual(passBuf, decDavBuf)) {
-        db.prepare('UPDATE credentials SET last_used_at = ? WHERE id = 1').run(new Date().toISOString());
-        return { ok: true, username: row.username };
-      }
+    const reqUser = decoded.slice(0, colonIdx);
+    const reqPass = decoded.slice(colonIdx + 1);
+
+    if (reqUser !== row.username) {
+      return { ok: false, error: 'WebDAV username must match your account login username' };
     }
 
-    // 3. Fallback: also accept the main login password stored in SQLite
-    const decryptedMainPass = decryptSecret(row.ciphertext_hex, row.iv_hex, row.auth_tag_hex);
-    const decMainBuf = Buffer.from(decryptedMainPass, 'utf8');
-    if (passBuf.length === decMainBuf.length && crypto.timingSafeEqual(passBuf, decMainBuf)) {
+    const expectedSafePass = decryptSecret(
+      row.webdav_ciphertext_hex,
+      row.webdav_iv_hex,
+      row.webdav_auth_tag_hex
+    );
+
+    const a = Buffer.from(reqPass, 'utf8');
+    const b = Buffer.from(expectedSafePass, 'utf8');
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
       db.prepare('UPDATE credentials SET last_used_at = ? WHERE id = 1').run(new Date().toISOString());
-      return { ok: true, username: row.username };
+      return { ok: true, username: reqUser };
     }
 
-    return { ok: false, username, error: 'Invalid WebDAV password' };
+    return { ok: false, error: 'Invalid WebDAV safe password' };
   } catch {
-    return { ok: false, username, error: 'Failed to verify SQLite credentials' };
+    return { ok: false, error: 'Invalid WebDAV credentials' };
   }
 }
 
@@ -336,106 +310,33 @@ function getDetectedLocalIp(): string {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
     for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) {
+      if (net.family === 'IPv4' && !net.internal && !net.address.startsWith('169.254.')) {
         return net.address;
       }
     }
   }
-  return '127.0.0.1';
+  return '0.0.0.0';
 }
 
 // ============================================================================
-// 2. .ENV & HOST FILESYSTEM ENGINE (Folders & Unencrypted Files)
+// 2. STACK ENVIRONMENT & SINGLE HOST VOLUMES ROOT FOLDER
 // ============================================================================
-interface FolderConfigItem {
-  slug: string;
-  exposed: boolean;
-  syncthing_enabled: boolean;
-  host_path: string;
-  container_path: string;
-}
-
 interface CustomHeaderItem {
   header_name: string;
   header_value: string;
   enabled: boolean;
 }
 
-function resolveFolderAbsPath(folder: FolderConfigItem): string {
-  const hp = (folder.host_path || `./host_volumes/${folder.slug.toLowerCase()}`).trim();
-  const resolved = path.isAbsolute(hp) ? path.normalize(hp) : path.resolve(__dirname, hp);
-  if (!resolved.startsWith(__dirname)) {
-    return path.join(HOST_VOLUMES_DIR, folder.slug.toLowerCase());
-  }
-  return resolved;
-}
-
-function toRelativeHostPath(absPath: string): string {
-  const rel = path.relative(__dirname, absPath).replace(/\\/g, '/');
-  if (!rel || rel === '') return '.';
-  return rel.startsWith('.') ? rel : `./${rel}`;
-}
-
-function ensureInitialEnvFile() {
-  const sampleDirs = ['documents', 'projects', 'media', 'backups', 'photos', 'shared_notes'];
-  for (const dir of sampleDirs) {
-    const abs = path.join(HOST_VOLUMES_DIR, dir);
-    fs.mkdirSync(abs, { recursive: true });
-    const existing = fs.readdirSync(abs).filter((n) => n !== '.stfolder');
-    if (existing.length === 0) {
-      fs.writeFileSync(
-        path.join(abs, `${dir}-info.txt`),
-        `Unencrypted file in host folder ./host_volumes/${dir}\nBridged directly between WebDAV and native Syncthing.\n`,
-        'utf8'
-      );
-    }
-  }
-
-  if (!fs.existsSync(ENV_STACK_FILE)) {
-    const detectedIp = getDetectedLocalIp();
-    const defaultEnv = [
-      '# VaultDAV & Syncthing Container Environment (.env)',
-      'PUID=1000',
-      'PGID=1000',
-      'TZ=UTC',
-      `WEBDAV_HOST="${detectedIp}"`,
-      'WEBDAV_PORT=8080',
-      'SYNCTHING_GUI_PORT=8384',
-      'SYNCTHING_SYNC_PORT=22000',
-      `SQLITE_MASTER_KEY="${MASTER_SECRET}"`,
-      'SQLITE_DB_PATH="/data/db/vaultdav.sqlite"',
-      'ENCRYPT_BRIDGED_FILES=false',
-      'WEBDAV_CUSTOM_HEADERS=""',
-      '',
-      '# Host Folders Exposed to Containers (Controlled directly via .env)',
-      'EXPOSE_FOLDER_DOCUMENTS=true',
-      'SYNCTHING_FOLDER_DOCUMENTS=true',
-      'HOST_PATH_DOCUMENTS="./host_volumes/documents"',
-      'CONTAINER_PATH_DOCUMENTS="/var/webdav/documents"',
-      '',
-      'EXPOSE_FOLDER_PROJECTS=true',
-      'SYNCTHING_FOLDER_PROJECTS=true',
-      'HOST_PATH_PROJECTS="./host_volumes/projects"',
-      'CONTAINER_PATH_PROJECTS="/var/webdav/projects"',
-      '',
-      'EXPOSE_FOLDER_MEDIA=true',
-      'SYNCTHING_FOLDER_MEDIA=true',
-      'HOST_PATH_MEDIA="./host_volumes/media"',
-      'CONTAINER_PATH_MEDIA="/var/webdav/media"',
-    ].join('\n');
-    fs.writeFileSync(ENV_STACK_FILE, defaultEnv, 'utf8');
-  }
-}
-ensureInitialEnvFile();
-
 function parseStackEnv(): {
-  folders: FolderConfigItem[];
   headers: CustomHeaderItem[];
   webdavHost: string;
   webdavPort: string;
 } {
-  ensureInitialEnvFile();
-  const raw = fs.readFileSync(ENV_STACK_FILE, 'utf8');
+  let raw = '';
+  if (fs.existsSync(ENV_STACK_FILE)) {
+    raw = fs.readFileSync(ENV_STACK_FILE, 'utf8');
+  }
+
   const map: Record<string, string> = {};
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -447,21 +348,6 @@ function parseStackEnv(): {
     map[key] = val;
   }
 
-  const slugs = new Set<string>();
-  for (const key of Object.keys(map)) {
-    if (key.startsWith('EXPOSE_FOLDER_')) {
-      slugs.add(key.replace('EXPOSE_FOLDER_', ''));
-    }
-  }
-
-  const folders: FolderConfigItem[] = Array.from(slugs).map((slug) => ({
-    slug,
-    exposed: map[`EXPOSE_FOLDER_${slug}`] === 'true',
-    syncthing_enabled: map[`SYNCTHING_FOLDER_${slug}`] !== 'false',
-    host_path: map[`HOST_PATH_${slug}`] || `./host_volumes/${slug.toLowerCase()}`,
-    container_path: map[`CONTAINER_PATH_${slug}`] || `/var/webdav/${slug.toLowerCase()}`,
-  }));
-
   const headers: CustomHeaderItem[] = [];
   const rawHeaders = map['WEBDAV_CUSTOM_HEADERS'] || '';
   if (rawHeaders) {
@@ -472,12 +358,6 @@ function parseStackEnv(): {
       if (colonIdx !== -1) {
         const hName = nv.slice(0, colonIdx).trim();
         const hVal = nv.slice(colonIdx + 1).trim();
-        if (
-          (hName === 'X-VaultDAV-Node' && hVal === 'vaultdav-sqlite-aes256gcm') ||
-          (hName === 'X-Content-Type-Options' && hVal === 'nosniff')
-        ) {
-          continue;
-        }
         headers.push({
           header_name: hName,
           header_value: hVal,
@@ -487,14 +367,14 @@ function parseStackEnv(): {
     }
   }
 
-  const webdavHost = map['WEBDAV_HOST'] || getDetectedLocalIp();
+  const rawHost = map['WEBDAV_HOST'] || getDetectedLocalIp();
+  const webdavHost = rawHost.startsWith('169.254.') ? '0.0.0.0' : rawHost;
   const webdavPort = map['WEBDAV_PORT'] || '8080';
 
-  return { folders, headers, webdavHost, webdavPort };
+  return { headers, webdavHost, webdavPort };
 }
 
 function writeStackEnv(
-  folders: FolderConfigItem[],
   headers: CustomHeaderItem[],
   webdavHost?: string,
   webdavPort?: string
@@ -507,7 +387,7 @@ function writeStackEnv(
     .map((h) => `${h.header_name}:${h.header_value}|${h.enabled ? '1' : '0'}`)
     .join(';');
 
-  const lines: string[] = [
+  const lines = [
     '# VaultDAV & Syncthing Container Environment (.env)',
     'PUID=1000',
     'PGID=1000',
@@ -525,117 +405,127 @@ function writeStackEnv(
     'ENCRYPT_BRIDGED_FILES=false',
     `WEBDAV_CUSTOM_HEADERS="${serializedHeaders}"`,
     '',
-    '# Host Folders Exposed to Containers (Read directly from .env & filesystem)',
+    '# Single Host Volumes Mount (All subfolders and files are configured inside this folder)',
+    'HOST_VOLUMES_PATH="./host_volumes"',
+    'CONTAINER_VOLUMES_PATH="/var/webdav"',
+    '',
   ];
-
-  for (const f of folders) {
-    lines.push(`EXPOSE_FOLDER_${f.slug}=${f.exposed ? 'true' : 'false'}`);
-    lines.push(`SYNCTHING_FOLDER_${f.slug}=${f.syncthing_enabled ? 'true' : 'false'}`);
-    lines.push(`HOST_PATH_${f.slug}="${f.host_path}"`);
-    lines.push(`CONTAINER_PATH_${f.slug}="${f.container_path}"`);
-    lines.push('');
-  }
 
   const envContent = lines.join('\n');
   fs.writeFileSync(ENV_STACK_FILE, envContent, 'utf8');
   return envContent;
 }
 
-function ensureFilesystemFolders() {
-  const { folders } = parseStackEnv();
-  for (const f of folders) {
-    const absDir = resolveFolderAbsPath(f);
-    fs.mkdirSync(path.join(absDir, '.stfolder'), { recursive: true });
-    const existing = fs.readdirSync(absDir).filter((name) => name !== '.stfolder');
-    if (existing.length === 0) {
-      fs.writeFileSync(
-        path.join(absDir, `${f.slug.toLowerCase()}-readme.md`),
-        `# ${f.slug} Shared Volume\n\n- Host Path: \`${f.host_path}\`\n- Exposed via \`EXPOSE_FOLDER_${f.slug}=${f.exposed}\` in \`.env\`\n- Stored unencrypted on disk and bridged between WebDAV and native Syncthing.\n`,
-        'utf8'
-      );
-    }
-  }
+function readHostVolumesItems(): {
+  slug: string;
+  folder_name: string;
+  host_path: string;
+  container_path: string;
+  exposed: boolean;
+  syncthing_enabled: boolean;
+  fileCount: number;
+  totalBytes: number;
+  files: string[];
+}[] {
+  fs.mkdirSync(HOST_VOLUMES_DIR, { recursive: true });
+  const entries = fs.readdirSync(HOST_VOLUMES_DIR, { withFileTypes: true });
+
+  const folders = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+    .map((e) => {
+      const folderPath = path.join(HOST_VOLUMES_DIR, e.name);
+      let fileCount = 0;
+      let totalBytes = 0;
+      const files: string[] = [];
+
+      try {
+        for (const f of fs.readdirSync(folderPath, { withFileTypes: true })) {
+          if (f.name === '.stfolder') continue;
+          if (f.isFile()) {
+            fileCount++;
+            files.push(f.name);
+            try {
+              totalBytes += fs.statSync(path.join(folderPath, f.name)).size;
+            } catch {}
+          } else if (f.isDirectory()) {
+            files.push(`${f.name}/`);
+          }
+        }
+      } catch {}
+
+      return {
+        slug: e.name.toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
+        folder_name: e.name,
+        host_path: `./host_volumes/${e.name}`,
+        container_path: `/var/webdav/${e.name}`,
+        exposed: true,
+        syncthing_enabled: true,
+        fileCount,
+        totalBytes,
+        files,
+      };
+    });
+
+  return folders;
 }
-ensureFilesystemFolders();
 
-function readFilesystemFoldersWithStats() {
-  const { folders } = parseStackEnv();
-  return folders.map((f) => {
-    const absDir = resolveFolderAbsPath(f);
-    fs.mkdirSync(path.join(absDir, '.stfolder'), { recursive: true });
-    let fileCount = 0;
-    let totalBytes = 0;
-    const files: string[] = [];
-    for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
-      if (entry.name === '.stfolder') continue;
-      if (!entry.isDirectory()) {
-        fileCount++;
-        files.push(entry.name);
-        try {
-          totalBytes += fs.statSync(path.join(absDir, entry.name)).size;
-        } catch {}
-      } else {
-        files.push(`${entry.name}/`);
-      }
-    }
-    return {
-      slug: f.slug,
-      env_expose_key: `EXPOSE_FOLDER_${f.slug}`,
-      env_host_key: `HOST_PATH_${f.slug}`,
-      env_container_key: `CONTAINER_PATH_${f.slug}`,
-      host_path: f.host_path,
-      container_path: f.container_path,
-      exposed: f.exposed,
-      syncthing_enabled: f.syncthing_enabled,
-      fileCount,
-      totalBytes,
-      files,
-    };
-  });
-}
-
-// ============================================================================
-// 3. NATIVE SYNCTHING BINARY DAEMON MANAGER & LIVE CONFIG SYNC
-// ============================================================================
-let syncthingProc: ChildProcess | null = null;
-let localSyncthingDeviceId = 'BKMTX3T-MODC2KK-PY7UWVU-Q43YZ3J-UORQVQS-5JH2KIO-HO6PT7P-K6UY2AY';
-
-function buildNativeSyncthingConfigXml(): string {
-  const configPath = path.join(SYNCTHING_HOME_DIR, 'config.xml');
-  if (fs.existsSync(configPath)) {
-    const raw = fs.readFileSync(configPath, 'utf8');
-    const match = raw.match(/<device id="([A-Z0-9-]+)"/);
-    if (match && match[1]) {
-      localSyncthingDeviceId = match[1];
-    }
-  }
-
-  const { folders } = parseStackEnv();
-  const activeSyncFolders = folders.filter((f) => f.exposed && f.syncthing_enabled);
-
-  const folderBlocks = activeSyncFolders
-    .map((f) => {
-      const absHostPath = resolveFolderAbsPath(f);
-      fs.mkdirSync(path.join(absHostPath, '.stfolder'), { recursive: true });
-      return `    <folder id="vaultdav-${f.slug.toLowerCase()}" label="${f.slug} (${f.host_path})" path="${absHostPath}" type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="true" fsWatcherDelayS="2" ignorePerms="false" autoNormalize="true">
+// Syncthing config xml generator (ONE SINGLE FOLDER - NO NESTED SUBFOLDERS)
+function buildSyncthingConfigXml(): string {
+  const xml = `<configuration version="37">
+    <folder id="host-volumes" label="Host Volumes (/var/webdav)" path="/var/webdav" type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="true" fsWatcherDelayS="2" ignorePerms="false" autoNormalize="true">
         <filesystemType>basic</filesystemType>
-        <device id="${localSyncthingDeviceId}" introducedBy="">
-            <encryptionPassword></encryptionPassword>
-        </device>
         <minDiskFree unit="%">1</minDiskFree>
         <markerName>.stfolder</markerName>
-    </folder>`;
-    })
-    .join('\n');
+    </folder>
+    <gui enabled="true" tls="false" debugging="false" sendBasicAuthPrompt="false">
+        <address>0.0.0.0:8384</address>
+        <apikey>${SYNCTHING_API_KEY}</apikey>
+        <theme>dark</theme>
+        <insecureSkipHostcheck>true</insecureSkipHostcheck>
+        <insecureAdminAccess>true</insecureAdminAccess>
+    </gui>
+    <options>
+        <listenAddress>default</listenAddress>
+        <globalAnnounceEnabled>true</globalAnnounceEnabled>
+        <localAnnounceEnabled>true</localAnnounceEnabled>
+        <relaysEnabled>true</relaysEnabled>
+        <natEnabled>true</natEnabled>
+        <startBrowser>false</startBrowser>
+        <urAccepted>-1</urAccepted>
+        <autoUpgradeIntervalH>0</autoUpgradeIntervalH>
+        <crashReportingEnabled>false</crashReportingEnabled>
+    </options>
+</configuration>
+`;
+  try {
+    fs.writeFileSync(SYNCTHING_CONFIG_FILE, xml, 'utf8');
+  } catch {}
+  return xml;
+}
 
-  const xml = `<configuration version="37">
-${folderBlocks}
-    <device id="${localSyncthingDeviceId}" name="vaultdav-syncthing-node" compression="metadata" introducer="false" skipIntroductionRemovals="false" introducedBy="">
-        <address>dynamic</address>
-        <paused>false</paused>
-        <autoAcceptFolders>false</autoAcceptFolders>
-        <untrusted>false</untrusted>
-    </device>
+let syncthingProc: ChildProcess | null = null;
+function startLocalSyncthingDaemon() {
+  if (process.env.SYNCTHING_URL) return;
+  if (!fs.existsSync(SYNCTHING_BIN)) return;
+
+  try {
+    fs.chmodSync(SYNCTHING_BIN, 0o755);
+  } catch {}
+
+  const localHome = RUNTIME_SYNCTHING_DIR;
+  if (!fs.existsSync(path.join(localHome, 'cert.pem'))) {
+    try {
+      execSync(`${SYNCTHING_BIN} generate --home=${localHome}`);
+    } catch {}
+  }
+
+  // Local config: path is HOST_VOLUMES_DIR
+  const localXml = `<configuration version="37">
+    <folder id="host-volumes" label="Host Volumes (${HOST_VOLUMES_DIR})" path="${HOST_VOLUMES_DIR}" type="sendreceive" rescanIntervalS="60" fsWatcherEnabled="true" fsWatcherDelayS="2" ignorePerms="false" autoNormalize="true">
+        <filesystemType>basic</filesystemType>
+        <minDiskFree unit="%">1</minDiskFree>
+        <markerName>.stfolder</markerName>
+    </folder>
     <gui enabled="true" tls="false" debugging="false" sendBasicAuthPrompt="false">
         <address>127.0.0.1:8384</address>
         <apikey>${SYNCTHING_API_KEY}</apikey>
@@ -656,64 +546,8 @@ ${folderBlocks}
     </options>
 </configuration>`;
 
-  fs.writeFileSync(configPath, xml, 'utf8');
-  return xml;
-}
-
-async function syncFoldersToRunningSyncthing() {
-  const xml = buildNativeSyncthingConfigXml();
-  const { folders } = parseStackEnv();
-  const activeSyncFolders = folders.filter((f) => f.exposed && f.syncthing_enabled);
-
-  try {
-    const folderPayload = activeSyncFolders.map((f) => ({
-      id: `vaultdav-${f.slug.toLowerCase()}`,
-      label: `${f.slug} (${f.host_path})`,
-      filesystemType: 'basic',
-      path: resolveFolderAbsPath(f),
-      type: 'sendreceive',
-      devices: [{ deviceID: localSyncthingDeviceId, introducedBy: '', encryptionPassword: '' }],
-      rescanIntervalS: 60,
-      fsWatcherEnabled: true,
-      fsWatcherDelayS: 2,
-      ignorePerms: false,
-      autoNormalize: true,
-      markerName: '.stfolder',
-    }));
-
-    await fetch('http://127.0.0.1:8384/rest/config/folders', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': SYNCTHING_API_KEY,
-      },
-      body: JSON.stringify(folderPayload),
-    });
-  } catch {
-    // Syncthing may still be starting up
-  }
-  return xml;
-}
-
-function startNativeSyncthingDaemon() {
-  if (!fs.existsSync(SYNCTHING_BIN)) {
-    console.warn('Syncthing binary not found at', SYNCTHING_BIN);
-    return;
-  }
-
-  try {
-    fs.chmodSync(SYNCTHING_BIN, 0o755);
-  } catch (err) {
-    console.warn('Failed to chmod syncthing binary:', err);
-  }
-
-  if (!fs.existsSync(path.join(SYNCTHING_HOME_DIR, 'cert.pem'))) {
-    try {
-      execSync(`${SYNCTHING_BIN} generate --home=${SYNCTHING_HOME_DIR}`);
-    } catch {}
-  }
-
-  buildNativeSyncthingConfigXml();
+  fs.writeFileSync(path.join(localHome, 'config.xml'), localXml, 'utf8');
+  fs.mkdirSync(path.join(HOST_VOLUMES_DIR, '.stfolder'), { recursive: true });
 
   syncthingProc = spawn(
     SYNCTHING_BIN,
@@ -721,7 +555,7 @@ function startNativeSyncthingDaemon() {
       'serve',
       '--no-browser',
       '--no-upgrade',
-      `--home=${SYNCTHING_HOME_DIR}`,
+      `--home=${localHome}`,
       '--gui-address=127.0.0.1:8384',
     ],
     {
@@ -729,32 +563,15 @@ function startNativeSyncthingDaemon() {
       env: { ...process.env, STNOUPGRADE: '1' },
     }
   );
-
-  syncthingProc.on('error', (err) => {
-    console.error('Native Syncthing daemon error:', err);
-  });
-
-  syncthingProc.on('exit', (code) => {
-    console.log(`Native Syncthing daemon exited with code ${code}`);
-  });
 }
 
 function generateStackArtifacts() {
-  const { folders, headers, webdavHost, webdavPort } = parseStackEnv();
-  const envContent = writeStackEnv(folders, headers, webdavHost, webdavPort);
-  const exposedFolders = folders.filter((f) => f.exposed);
-  const syncthingFolders = folders.filter((f) => f.exposed && f.syncthing_enabled);
-
-  const webdavVolumeLines = exposedFolders.map(
-    (f) => `      - \${HOST_PATH_${f.slug}:-${f.host_path}}:\${CONTAINER_PATH_${f.slug}:-${f.container_path}}:rw`
-  );
-  const syncthingVolumeLines = syncthingFolders.map(
-    (f) => `      - \${HOST_PATH_${f.slug}:-${f.host_path}}:\${CONTAINER_PATH_${f.slug}:-${f.container_path}}:rw`
-  );
+  const { headers, webdavHost, webdavPort } = parseStackEnv();
+  const envContent = writeStackEnv(headers, webdavHost, webdavPort);
 
   const composeContent = `# Docker Compose — VaultDAV + Syncthing Stack
 # SQLite (/data/db/vaultdav.sqlite) is used strictly for encrypted credentials.
-# Folders and unencrypted files are mounted directly via .env into both containers.
+# Only ./host_volumes is exposed to both containers; all subfolders are configured inside ./host_volumes.
 
 services:
   vaultdav:
@@ -770,10 +587,13 @@ services:
     environment:
       - ENCRYPT_BRIDGED_FILES=false
       - WEBDAV_HOST=\${WEBDAV_HOST:-0.0.0.0}
+      - SQLITE_DB_PATH=/data/db/vaultdav.sqlite
+      - HOST_VOLUMES_DIR=/var/webdav
+      - SYNCTHING_URL=http://syncthing:8384
     volumes:
       - ./data/db:/data/db
-      # Host Folders Exposed via .env (Unencrypted on disk)
-${webdavVolumeLines.length > 0 ? webdavVolumeLines.join('\n') : '      # No folders enabled in .env'}
+      # Single exposed host_volumes folder
+      - \${HOST_VOLUMES_PATH:-./host_volumes}:/var/webdav:rw
     networks:
       - vaultdav_net
 
@@ -795,8 +615,8 @@ ${webdavVolumeLines.length > 0 ? webdavVolumeLines.join('\n') : '      # No fold
       - "21027:21027/udp"
     volumes:
       - ./data/syncthing-config:/config
-      # Identical Unencrypted Host Folders Mounted into Syncthing
-${syncthingVolumeLines.length > 0 ? syncthingVolumeLines.join('\n') : '      # No Syncthing folders enabled'}
+      # Single exposed host_volumes folder
+      - \${HOST_VOLUMES_PATH:-./host_volumes}:/var/webdav:rw
     networks:
       - vaultdav_net
 
@@ -806,78 +626,95 @@ networks:
 `;
 
   const dockerfileContent = `FROM node:22-alpine
+
+# Install build dependencies for better-sqlite3 native addon
 RUN apk add --no-cache python3 make g++ sqlite
+
 WORKDIR /app
+
 COPY package*.json ./
 RUN npm install
+
 COPY . .
 RUN npm run build
-RUN mkdir -p /data/db /var/webdav/documents /var/webdav/projects /var/webdav/media /var/webdav/backups
+
+# Create persistent directories for SQLite database and single host_volumes mount
+RUN mkdir -p /data/db /var/webdav
+
 EXPOSE 3000
+
 CMD ["npm", "run", "start"]
 `;
 
-  const syncthingXmlContent = fs.existsSync(path.join(SYNCTHING_HOME_DIR, 'config.xml'))
-    ? fs.readFileSync(path.join(SYNCTHING_HOME_DIR, 'config.xml'), 'utf8')
-    : buildNativeSyncthingConfigXml();
+  const syncthingXmlContent = buildSyncthingConfigXml();
 
   return { envContent, composeContent, dockerfileContent, syncthingXmlContent };
 }
 
-// Generate a complete zip archive ready for `docker compose up -d`
+function addDirectoryToZip(zip: JSZip, fsDirPath: string, zipDirPath: string) {
+  if (!fs.existsSync(fsDirPath)) return;
+  for (const entry of fs.readdirSync(fsDirPath, { withFileTypes: true })) {
+    if (entry.name === '.stfolder' || entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist') continue;
+    const fullFsPath = path.join(fsDirPath, entry.name);
+    const fullZipPath = `${zipDirPath}/${entry.name}`;
+    if (entry.isDirectory()) {
+      addDirectoryToZip(zip, fullFsPath, fullZipPath);
+    } else if (entry.isFile()) {
+      zip.file(fullZipPath, fs.readFileSync(fullFsPath));
+    }
+  }
+}
+
 async function createDockerComposeZipBuffer(): Promise<Buffer> {
   const zip = new JSZip();
   const artifacts = generateStackArtifacts();
   const { webdavHost, webdavPort } = parseStackEnv();
 
-  // Root stack orchestration files
-  zip.file('docker-compose.yml', artifacts.composeContent);
+  // Root stack orchestration files (prefer current files on disk to preserve any manual edits)
+  const composePath = path.join(__dirname, 'docker-compose.yml');
+  const envExamplePath = path.join(__dirname, '.env.example');
+  const dockerfilePath = path.join(__dirname, 'Dockerfile');
+  const syncthingConfigPath = path.join(SYNCTHING_CONFIG_DIR, 'config.xml');
+
+  zip.file(
+    'docker-compose.yml',
+    fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf8') : artifacts.composeContent
+  );
   zip.file('.env', artifacts.envContent);
-  zip.file('.env.example', artifacts.envContent);
-  zip.file('Dockerfile', artifacts.dockerfileContent);
+  zip.file(
+    '.env.example',
+    fs.existsSync(envExamplePath) ? fs.readFileSync(envExamplePath, 'utf8') : artifacts.envContent
+  );
+  zip.file(
+    'Dockerfile',
+    fs.existsSync(dockerfilePath) ? fs.readFileSync(dockerfilePath, 'utf8') : artifacts.dockerfileContent
+  );
 
   // App build files
-  if (fs.existsSync(path.join(__dirname, 'package.json'))) {
-    zip.file('package.json', fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-  }
-  if (fs.existsSync(path.join(__dirname, 'tsconfig.json'))) {
-    zip.file('tsconfig.json', fs.readFileSync(path.join(__dirname, 'tsconfig.json'), 'utf8'));
-  }
-  if (fs.existsSync(path.join(__dirname, 'vite.config.ts'))) {
-    zip.file('vite.config.ts', fs.readFileSync(path.join(__dirname, 'vite.config.ts'), 'utf8'));
-  }
-  if (fs.existsSync(path.join(__dirname, 'index.html'))) {
-    zip.file('index.html', fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8'));
-  }
-  if (fs.existsSync(path.join(__dirname, 'server.ts'))) {
-    zip.file('server.ts', fs.readFileSync(path.join(__dirname, 'server.ts'), 'utf8'));
-  }
-
-  // App source code directory
-  const srcDir = path.join(__dirname, 'src');
-  if (fs.existsSync(srcDir)) {
-    const srcFiles = fs.readdirSync(srcDir);
-    for (const sf of srcFiles) {
-      const sfPath = path.join(srcDir, sf);
-      if (fs.statSync(sfPath).isFile()) {
-        zip.file(`src/${sf}`, fs.readFileSync(sfPath, 'utf8'));
-      }
+  const rootFiles = ['package.json', 'tsconfig.json', 'vite.config.ts', 'index.html', 'server.ts', 'metadata.json'];
+  for (const rf of rootFiles) {
+    const rfPath = path.join(__dirname, rf);
+    if (fs.existsSync(rfPath)) {
+      zip.file(rf, fs.readFileSync(rfPath));
     }
   }
 
-  // Syncthing initial configuration
-  zip.file('data/syncthing-config/config.xml', artifacts.syncthingXmlContent);
+  // App source code directory
+  addDirectoryToZip(zip, path.join(__dirname, 'src'), 'src');
 
-  // Pre-created host volume mount folders
-  const sampleVolumes = ['documents', 'projects', 'media', 'backups'];
-  for (const v of sampleVolumes) {
-    zip.file(
-      `host_volumes/${v}/README.md`,
-      `# Host Volume: ${v}\n\nExposed unencrypted and bridged between VaultDAV WebDAV and Syncthing.\n`
-    );
-  }
+  // Syncthing initial configuration (single unnested folder)
+  zip.file(
+    'data/syncthing-config/config.xml',
+    fs.existsSync(syncthingConfigPath) ? fs.readFileSync(syncthingConfigPath, 'utf8') : artifacts.syncthingXmlContent
+  );
 
-  // Ready-to-run instructions
+  // Initial data/db directory placeholder
+  zip.folder('data/db');
+  zip.file('data/db/.gitkeep', '# SQLite credential database directory\n');
+
+  // Include ./host_volumes
+  addDirectoryToZip(zip, HOST_VOLUMES_DIR, 'host_volumes');
+
   const readme = `# VaultDAV + Syncthing Docker Compose Package
 
 This archive contains the complete, ready-to-run Docker Compose stack for **VaultDAV** and **Syncthing**.
@@ -885,99 +722,127 @@ This archive contains the complete, ready-to-run Docker Compose stack for **Vaul
 ## How to Run
 
 \`\`\`bash
-# 1. Unzip the archive
-unzip vaultdav-docker-compose.zip
+# 1. Unzip the archive into a folder
+unzip vaultdav-docker-compose.zip -d vaultdav-docker-compose
 cd vaultdav-docker-compose
 
-# 2. Start the stack in the background
-docker compose up -d
+# 2. Build and start the stack in the background
+docker compose up -d --build
 \`\`\`
 
 ## Access Endpoints
 
 - **VaultDAV & WebDAV**:
   - Web UI: http://localhost:${webdavPort} (or http://${webdavHost}:${webdavPort})
-  - WebDAV Endpoint: http://localhost:${webdavPort}/dav/
+  - WebDAV Root Endpoint: http://localhost:${webdavPort}/dav/
 - **Native Syncthing Web GUI**:
   - Web UI: http://localhost:8384
   - Synchronization Port: 22000 (TCP/UDP)
 
-## Security Architecture
+## Architecture
 
-1. **SQLite Used Strictly for Encrypted Credentials**:
-   Account passwords, TOTP secret, and auto-generated safe WebDAV passwords are stored in \`./data/db/vaultdav.sqlite\` encrypted with AES-256-GCM.
-2. **Unified Username**:
-   Your WebDAV username is identical to the login username you set during account setup.
-3. **Optional TOTP 2FA**:
+1. **Single \`./host_volumes\` Mount**:
+   \`docker-compose.yml\` and \`.env\` only expose the single \`./host_volumes\` parent folder (\`/var/webdav\` inside both containers). All subfolders (\`documents\`, \`projects\`, \`media\`, \`photos\`, \`backups\`, etc.) live inside \`./host_volumes\`.
+2. **SQLite Used Strictly for Encrypted Credentials**:
+   Account passwords, optional TOTP secret, and auto-generated safe WebDAV passwords are stored in \`./data/db/vaultdav.sqlite\` encrypted with AES-256-GCM.
+3. **Unified Username**:
+   Your WebDAV username is identical to the login username set during account setup.
+4. **Optional TOTP 2FA**:
    2FA can be enabled or disabled at any time from the Account & Security menu on the main dashboard.
-4. **Unencrypted Host Files**:
-   Files in \`./host_volumes/\` remain unencrypted on disk and are mounted directly into both containers.
 `;
   zip.file('README.md', readme);
 
-  const buf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+
+  // Keep static vaultdav-docker-compose.zip file synced to the root filesystem
   try {
-    fs.writeFileSync(STATIC_ZIP_FILE, buf);
+    fs.writeFileSync(path.join(__dirname, 'vaultdav-docker-compose.zip'), buffer);
   } catch {}
-  return buf;
+
+  return buffer;
+}
+
+function getMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeMap: Record<string, string> = {
+    '.txt': 'text/plain; charset=utf-8',
+    '.md': 'text/markdown; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.xml': 'application/xml; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.ts': 'text/plain; charset=utf-8',
+    '.tsx': 'text/plain; charset=utf-8',
+    '.yml': 'text/yaml; charset=utf-8',
+    '.yaml': 'text/yaml; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8',
+    '.pdf': 'application/pdf',
+    '.zip': 'application/zip',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    '.mp4': 'video/mp4',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+  };
+  return mimeMap[ext] || 'application/octet-stream';
 }
 
 function renderWebdavBrowserHtml(
   currentHref: string,
-  title: string,
   parentHref: string | null,
   items: { name: string; href: string; isDir: boolean; size: number; mtime: string }[]
 ): string {
   const rows = items
     .map(
-      (item) => `<tr class="border-b border-zinc-800/70 hover:bg-zinc-900/60">
-        <td class="py-2.5 px-4 font-mono text-xs">
-          <a href="${item.href}" class="text-blue-400 hover:underline font-medium">${item.name}${item.isDir ? '/' : ''}</a>
-        </td>
-        <td class="py-2.5 px-4 font-mono text-xs text-zinc-400">${item.isDir ? 'Directory' : `${item.size} B`}</td>
-        <td class="py-2.5 px-4 font-mono text-xs text-zinc-500">${item.mtime}</td>
+      (item) => `
+      <tr>
+        <td><a href="${item.href}">${item.isDir ? '📁 ' : '📄 '}${item.name}${item.isDir ? '/' : ''}</a></td>
+        <td>${item.isDir ? 'Directory' : `${item.size} B`}</td>
+        <td>${item.mtime}</td>
       </tr>`
     )
-    .join('\n');
+    .join('');
 
   return `<!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VaultDAV — ${title}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="utf-8" />
+  <title>VaultDAV — ${currentHref}</title>
+  <style>
+    body { background: #050507; color: #f4f4f5; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; margin: 0; padding: 32px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #27272a; padding-bottom: 16px; margin-bottom: 24px; }
+    h1 { font-size: 18px; margin: 0; color: #60a5fa; }
+    .badge { background: #1e293b; color: #60a5fa; padding: 4px 10px; border-radius: 4px; font-size: 12px; border: 1px solid #3b82f6; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #18181b; }
+    th { color: #a1a1aa; font-weight: 600; }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .meta { margin-top: 24px; font-size: 12px; color: #71717a; }
+  </style>
 </head>
-<body class="bg-[#050507] text-zinc-100 min-h-screen p-8 font-sans">
-  <div class="max-w-4xl mx-auto bg-[#0c0d10] border border-zinc-800 rounded-lg overflow-hidden">
-    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between">
-      <div>
-        <h1 class="text-sm font-semibold text-zinc-100 font-mono">${currentHref}</h1>
-        <p class="text-xs text-zinc-500 mt-0.5">VaultDAV Direct Domain / IP WebDAV Endpoint</p>
-      </div>
-      <a href="/" class="px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-md">Main App</a>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>VaultDAV Index of ${currentHref}</h1>
+      <span class="badge">Host Volumes Root Mount</span>
     </div>
-    <table class="w-full text-left border-collapse">
+    <table>
       <thead>
-        <tr class="border-b border-zinc-800 text-[11px] font-mono uppercase text-zinc-500 bg-[#07080a]">
-          <th class="py-2 px-4">Name</th>
-          <th class="py-2 px-4">Size</th>
-          <th class="py-2 px-4">Modified</th>
-        </tr>
+        <tr><th>Name</th><th>Size</th><th>Last Modified</th></tr>
       </thead>
       <tbody>
-        ${
-          parentHref
-            ? `<tr class="border-b border-zinc-800/70 hover:bg-zinc-900/60">
-                <td class="py-2.5 px-4 font-mono text-xs" colspan="3">
-                  <a href="${parentHref}" class="text-zinc-300 hover:text-blue-400">.. (Parent Directory)</a>
-                </td>
-              </tr>`
-            : ''
-        }
-        ${rows || `<tr><td colspan="3" class="py-6 px-4 text-xs font-mono text-zinc-500">Empty directory</td></tr>`}
+        ${parentHref ? `<tr><td><a href="${parentHref}">⬆️ Parent Directory (..)</a></td><td>-</td><td>-</td></tr>` : ''}
+        ${rows || '<tr><td colspan="3">Empty directory</td></tr>'}
       </tbody>
     </table>
+    <div class="meta">Served by VaultDAV RFC 4918 WebDAV Server · Single ./host_volumes Mount · SQLite AES-256-GCM Auth</div>
   </div>
 </body>
 </html>`;
@@ -985,32 +850,25 @@ function renderWebdavBrowserHtml(
 
 function requireAppAuth(req: Request, res: Response, next: NextFunction) {
   const token = String(req.headers['x-session-token'] || '');
-  if (token && activeSessions.has(token)) {
-    next();
+  const session = token ? activeSessions.get(token) : undefined;
+  if (!session) {
+    res.status(401).json({ error: 'Authentication required' });
     return;
   }
-  res.status(401).json({ error: 'Authentication required' });
+  (req as any).sessionUser = session.username;
+  next();
 }
 
 async function startServer() {
-  startNativeSyncthingDaemon();
-
-  // Pre-generate Docker zip file so it's ready on disk
-  try {
-    await createDockerComposeZipBuffer();
-  } catch (err) {
-    console.warn('Initial zip generation notice:', err);
-  }
+  startLocalSyncthingDaemon();
 
   const app = express();
 
-  // ============================================================================
-  // 1. Reverse Proxy to the REAL Native Syncthing Process on 127.0.0.1:8384
-  // ============================================================================
+  // 1. Syncthing Reverse Proxy
   app.use(
     '/syncthing',
     createProxyMiddleware({
-      target: 'http://127.0.0.1:8384',
+      target: SYNCTHING_TARGET_URL,
       changeOrigin: true,
       on: {
         proxyReq: (proxyReq) => {
@@ -1024,18 +882,36 @@ async function startServer() {
     })
   );
 
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.text({ type: ['text/*', 'application/xml', 'application/yaml', 'application/octet-stream'], limit: '10mb' }));
+  // 2. Public Docker Compose ZIP download endpoints
+  const handleZipDownload = async (_req: Request, res: Response) => {
+    try {
+      const zipBuffer = await createDockerComposeZipBuffer();
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', 'attachment; filename="vaultdav-docker-compose.zip"');
+      res.setHeader('Content-Length', String(zipBuffer.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(200).end(zipBuffer);
+    } catch (err: any) {
+      console.error('Failed to generate zip:', err);
+      res.status(500).json({ error: 'Failed to create docker zip package: ' + err.message });
+    }
+  };
+  app.get('/api/docker/download-zip', handleZipDownload);
+  app.get('/vaultdav-docker-compose.zip', handleZipDownload);
+
+  // Raw binary body parser for WebDAV (/dav)
+  app.use('/dav', express.raw({ type: '*/*', limit: '500mb' }));
+
+  app.use(express.json({ limit: '25mb' }));
+  app.use(express.text({ type: ['text/*', 'application/xml', 'application/yaml'], limit: '25mb' }));
 
   // ============================================================================
-  // 2. Single-Account SQLite Auth Endpoints (/api/auth/*)
-  // Registration requires ONLY Username & Password (TOTP 2FA can be added later)
+  // 3. Single-Account SQLite Auth Endpoints (/api/auth/*)
   // ============================================================================
   app.get('/api/auth/status', async (req: Request, res: Response) => {
     const account = db.prepare('SELECT username, totp_enabled, totp_ciphertext_hex FROM credentials WHERE id = 1').get() as any;
     const token = String(req.headers['x-session-token'] || '');
     const session = token ? activeSessions.get(token) : undefined;
-
     const isTotpEnabled = Boolean(account && account.totp_enabled && account.totp_ciphertext_hex);
 
     res.json({
@@ -1046,7 +922,6 @@ async function startServer() {
     });
   });
 
-  // Account creation: Only username and password required! TOTP 2FA is added later in account menu
   app.post('/api/auth/setup', (req: Request, res: Response) => {
     const existing = db.prepare('SELECT id FROM credentials WHERE id = 1').get();
     if (existing) {
@@ -1062,11 +937,8 @@ async function startServer() {
     }
 
     const encPass = encryptSecret(password);
-
-    // Auto-generate safe WebDAV 24-character password (username is strictly the same as login!)
     const webdavSafePassword = generateSafeWebdavPassword(24);
     const encWebdav = encryptSecret(webdavSafePassword);
-
     const now = new Date().toISOString();
 
     db.prepare(`
@@ -1120,188 +992,122 @@ async function startServer() {
   });
 
   // ============================================================================
-  // 3. Real RFC 4918 WebDAV Server (/dav and /dav/:slug/*)
-  // WebDAV username is STRICTLY the SAME as login username.
-  // All credentials saved in SQLite.
+  // 4. RFC 4918 WebDAV Server (/dav and /dav/*)
+  // Direct access to ./host_volumes root and all subfolders/files
   // ============================================================================
   const applyWebdavHeadersAndAuth = (req: Request, res: Response) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE');
+    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY');
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Depth, Overwrite, Destination, Content-Type, X-Requested-With, *');
     res.setHeader('Access-Control-Expose-Headers', 'DAV, Allow, X-Received-Custom-Headers');
 
-    const { folders, headers } = parseStackEnv();
+    const { headers } = parseStackEnv();
     for (const h of headers.filter((x) => x.enabled)) {
       try {
         res.setHeader(h.header_name, h.header_value);
       } catch {}
     }
 
-    const echoedClientHeaders: string[] = [];
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (k.startsWith('x-') || ['depth', 'overwrite', 'if-match'].includes(k.toLowerCase())) {
-        echoedClientHeaders.push(`${k}: ${String(v)}`);
-      }
-    }
-    if (echoedClientHeaders.length > 0) {
-      res.setHeader('X-Received-Custom-Headers', echoedClientHeaders.join(' | '));
-    }
-
     if (req.method.toUpperCase() === 'OPTIONS') {
       res.setHeader('DAV', '1, 2');
-      res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE');
+      res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY');
       res.status(200).end();
-      return { handled: true, folders };
+      return { handled: true };
     }
 
     const auth = verifyWebdavBasicAuth(req.headers.authorization);
     if (!auth.ok) {
       res.setHeader('WWW-Authenticate', 'Basic realm="VaultDAV Server"');
       res.status(401).send(auth.error || 'Unauthorized: WebDAV username (same as login) and safe password required');
-      return { handled: true, folders };
+      return { handled: true };
     }
 
-    return { handled: false, folders };
+    return { handled: false };
   };
 
-  // Root /dav and /dav/ endpoint
-  app.all(['/dav', '/dav/'], (req: Request, res: Response) => {
-    const { handled, folders } = applyWebdavHeadersAndAuth(req, res);
+  // Helper to map /dav request path to filesystem inside HOST_VOLUMES_DIR
+  function resolveWebdavPath(reqUrl: string): { fsPath: string; relPath: string; isRoot: boolean } | null {
+    const rawPath = reqUrl.split('?')[0];
+    const stripped = rawPath.replace(/^\/dav\/?/, '');
+    const decoded = decodeURIComponent(stripped);
+    const normalized = path.normalize(decoded).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^\/+/, '');
+    const fsPath = path.resolve(HOST_VOLUMES_DIR, normalized);
+    if (!fsPath.startsWith(HOST_VOLUMES_DIR)) {
+      return null;
+    }
+    return {
+      fsPath,
+      relPath: normalized,
+      isRoot: fsPath === HOST_VOLUMES_DIR,
+    };
+  }
+
+  app.all(['/dav', '/dav/*'], (req: Request, res: Response) => {
+    const { handled } = applyWebdavHeadersAndAuth(req, res);
     if (handled) return;
 
-    const exposed = folders.filter((f) => f.exposed);
-    const method = req.method.toUpperCase();
-
-    if (method === 'PROPFIND') {
-      const nowUtc = new Date().toUTCString();
-      const responsesXml: string[] = [
-        `  <D:response>
-    <D:href>/dav/</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:displayname>dav</D:displayname>
-        <D:getlastmodified>${nowUtc}</D:getlastmodified>
-        <D:getcontentlength>0</D:getcontentlength>
-        <D:resourcetype><D:collection/></D:resourcetype>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>`,
-      ];
-
-      if (req.headers.depth !== '0') {
-        for (const f of exposed) {
-          responsesXml.push(`  <D:response>
-    <D:href>/dav/${f.slug.toLowerCase()}/</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:displayname>${f.slug.toLowerCase()}</D:displayname>
-        <D:getlastmodified>${nowUtc}</D:getlastmodified>
-        <D:getcontentlength>0</D:getcontentlength>
-        <D:resourcetype><D:collection/></D:resourcetype>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>`);
-        }
-      }
-
-      const xml = `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n${responsesXml.join('\n')}\n</D:multistatus>`;
-      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-      res.status(207).send(xml);
-      return;
-    }
-
-    if (method === 'GET' || method === 'HEAD') {
-      const items = exposed.map((f) => ({
-        name: f.slug.toLowerCase(),
-        href: `/dav/${f.slug.toLowerCase()}/`,
-        isDir: true,
-        size: 0,
-        mtime: new Date().toUTCString(),
-      }));
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.status(200).send(renderWebdavBrowserHtml('/dav/', 'WebDAV Root Mounts', null, items));
-      return;
-    }
-
-    res.status(405).send('Method Not Allowed');
-  });
-
-  app.all('/dav/:slug*', (req: Request, res: Response) => {
-    const { handled, folders } = applyWebdavHeadersAndAuth(req, res);
-    if (handled) return;
-
-    const slug = (req.params.slug || '').toUpperCase();
-    const rawSubPath = decodeURIComponent((req.params as any)[0] || '');
-    const method = req.method.toUpperCase();
-
-    const folder = folders.find((f) => f.slug === slug);
-    if (!folder) {
-      res.status(404).send(`WebDAV Mount /dav/${slug.toLowerCase()} not found in .env`);
-      return;
-    }
-
-    if (!folder.exposed) {
-      res.status(403).send(`Folder ${slug} is disabled via EXPOSE_FOLDER_${slug}=false in .env`);
-      return;
-    }
-
-    const baseMountDir = resolveFolderAbsPath(folder);
-    const safeSubPath = path.normalize(rawSubPath).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^\/+/, '');
-    const targetFsPath = path.join(baseMountDir, safeSubPath);
-
-    if (!targetFsPath.startsWith(baseMountDir)) {
+    const resolved = resolveWebdavPath(req.originalUrl || req.url);
+    if (!resolved) {
       res.status(403).send('Forbidden path');
       return;
     }
 
+    const { fsPath, relPath, isRoot } = resolved;
+    const method = req.method.toUpperCase();
+
+    // PROPFIND
     if (method === 'PROPFIND') {
-      if (!fs.existsSync(targetFsPath)) {
+      if (!fs.existsSync(fsPath)) {
         res.status(404).send('Not Found');
         return;
       }
-      const stat = fs.statSync(targetFsPath);
+      const stat = fs.statSync(fsPath);
+      const isDir = stat.isDirectory();
       const responsesXml: string[] = [];
 
       const escapeXml = (str: string) =>
         str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-      const buildPropXml = (href: string, itemStat: fs.Stats, displayName: string) => {
-        const isDir = itemStat.isDirectory();
-        return `  <D:response>
-    <D:href>${href}</D:href>
+      const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+      const baseHref = isRoot ? '/dav/' : `/dav/${cleanRel}${isDir ? '/' : ''}`;
+
+      responsesXml.push(`  <D:response>
+    <D:href>${baseHref}</D:href>
     <D:propstat>
       <D:prop>
-        <D:displayname>${escapeXml(displayName)}</D:displayname>
-        <D:getlastmodified>${itemStat.mtime.toUTCString()}</D:getlastmodified>
-        <D:getcontentlength>${isDir ? 0 : itemStat.size}</D:getcontentlength>
+        <D:displayname>${escapeXml(isRoot ? 'dav' : path.basename(fsPath))}</D:displayname>
+        <D:getlastmodified>${stat.mtime.toUTCString()}</D:getlastmodified>
+        <D:getcontentlength>${isDir ? 0 : stat.size}</D:getcontentlength>
         <D:resourcetype>${isDir ? '<D:collection/>' : ''}</D:resourcetype>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
-  </D:response>`;
-      };
+  </D:response>`);
 
-      const cleanSub = safeSubPath.replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
-      const encodedSub = cleanSub
-        ? cleanSub
-            .split('/')
-            .map((s) => encodeURIComponent(s))
-            .join('/')
-        : '';
-      const baseHref = `/dav/${slug.toLowerCase()}${encodedSub ? '/' + encodedSub : ''}${stat.isDirectory() ? '/' : ''}`;
-      responsesXml.push(buildPropXml(baseHref, stat, path.basename(targetFsPath) || slug.toLowerCase()));
-
-      if (stat.isDirectory() && req.headers.depth !== '0') {
-        const children = fs.readdirSync(targetFsPath).filter((c) => c !== '.stfolder');
-        for (const child of children) {
-          try {
-            const childStat = fs.statSync(path.join(targetFsPath, child));
-            const childHref = `${baseHref.replace(/\/$/, '')}/${encodeURIComponent(child)}${childStat.isDirectory() ? '/' : ''}`;
-            responsesXml.push(buildPropXml(childHref, childStat, child));
-          } catch {}
-        }
+      if (isDir && req.headers.depth !== '0') {
+        try {
+          const children = fs.readdirSync(fsPath).filter((c) => c !== '.stfolder');
+          for (const child of children) {
+            try {
+              const childPath = path.join(fsPath, child);
+              const childStat = fs.statSync(childPath);
+              const childIsDir = childStat.isDirectory();
+              const childHref = `${baseHref}${encodeURIComponent(child)}${childIsDir ? '/' : ''}`;
+              responsesXml.push(`  <D:response>
+    <D:href>${childHref}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:displayname>${escapeXml(child)}</D:displayname>
+        <D:getlastmodified>${childStat.mtime.toUTCString()}</D:getlastmodified>
+        <D:getcontentlength>${childIsDir ? 0 : childStat.size}</D:getcontentlength>
+        <D:resourcetype>${childIsDir ? '<D:collection/>' : ''}</D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>`);
+            } catch {}
+          }
+        } catch {}
       }
 
       const xml = `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n${responsesXml.join('\n')}\n</D:multistatus>`;
@@ -1310,60 +1116,112 @@ async function startServer() {
       return;
     }
 
+    // GET / HEAD
     if (method === 'GET' || method === 'HEAD') {
-      if (!fs.existsSync(targetFsPath)) {
-        res.status(404).send('File not found');
+      if (!fs.existsSync(fsPath)) {
+        res.status(404).send('Not Found');
         return;
       }
-      const stat = fs.statSync(targetFsPath);
+      const stat = fs.statSync(fsPath);
       if (stat.isDirectory()) {
-        const cleanSub = safeSubPath.replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
-        const currentHref = `/dav/${slug.toLowerCase()}/${cleanSub ? cleanSub + '/' : ''}`;
-        const parentHref = cleanSub
-          ? `/dav/${slug.toLowerCase()}/${cleanSub.split('/').slice(0, -1).join('/')}`
-          : '/dav/';
-        const children = fs
-          .readdirSync(targetFsPath)
+        const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+        const currentHref = isRoot ? '/dav/' : `/dav/${cleanRel}/`;
+        let parentHref: string | null = null;
+        if (!isRoot) {
+          const parts = cleanRel.split('/');
+          parts.pop();
+          parentHref = parts.length > 0 ? `/dav/${parts.join('/')}/` : '/dav/';
+        }
+
+        const items = fs
+          .readdirSync(fsPath)
           .filter((c) => c !== '.stfolder')
           .map((child) => {
-            const cStat = fs.statSync(path.join(targetFsPath, child));
+            const cStat = fs.statSync(path.join(fsPath, child));
             return {
               name: child,
-              href: `${currentHref.replace(/\/$/, '')}/${encodeURIComponent(child)}${cStat.isDirectory() ? '/' : ''}`,
+              href: `${currentHref}${encodeURIComponent(child)}${cStat.isDirectory() ? '/' : ''}`,
               isDir: cStat.isDirectory(),
               size: cStat.isDirectory() ? 0 : cStat.size,
               mtime: cStat.mtime.toUTCString(),
             };
           });
+
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.status(200).send(renderWebdavBrowserHtml(currentHref, slug, parentHref, children));
+        res.status(200).send(renderWebdavBrowserHtml(currentHref, parentHref, items));
         return;
       }
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.status(200).send(fs.readFileSync(targetFsPath, 'utf8'));
+
+      // Binary-safe file serving
+      res.setHeader('Content-Type', getMimeType(fsPath));
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader('Last-Modified', stat.mtime.toUTCString());
+      if (method === 'HEAD') {
+        res.status(200).end();
+      } else {
+        const stream = fs.createReadStream(fsPath);
+        stream.pipe(res);
+      }
       return;
     }
 
+    // PUT
     if (method === 'PUT') {
-      fs.mkdirSync(path.dirname(targetFsPath), { recursive: true });
-      const bodyContent = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? '', null, 2);
-      fs.writeFileSync(targetFsPath, bodyContent, 'utf8');
+      if (isRoot) {
+        res.status(405).send('Cannot overwrite root collection');
+        return;
+      }
+      fs.mkdirSync(path.dirname(fsPath), { recursive: true });
+
+      if (Buffer.isBuffer(req.body)) {
+        fs.writeFileSync(fsPath, req.body);
+        res.status(201).send('Created');
+      } else if (typeof req.body === 'string') {
+        fs.writeFileSync(fsPath, req.body, 'utf8');
+        res.status(201).send('Created');
+      } else if (req.body && typeof req.body === 'object' && !('pipe' in req.body)) {
+        fs.writeFileSync(fsPath, JSON.stringify(req.body, null, 2), 'utf8');
+        res.status(201).send('Created');
+      } else if (typeof (req as any).pipe === 'function' && !req.readableEnded) {
+        // Stream writing when body parser has not consumed req
+        const out = fs.createWriteStream(fsPath);
+        req.pipe(out);
+        out.on('finish', () => {
+          res.status(201).send('Created');
+        });
+        out.on('error', (err) => {
+          res.status(500).send('Write error: ' + err.message);
+        });
+      } else {
+        // Fallback: create empty file if body was empty
+        fs.writeFileSync(fsPath, Buffer.alloc(0));
+        res.status(201).send('Created');
+      }
+      return;
+    }
+
+    // MKCOL
+    if (method === 'MKCOL') {
+      if (fs.existsSync(fsPath)) {
+        res.status(405).send('Collection already exists');
+        return;
+      }
+      fs.mkdirSync(fsPath, { recursive: true });
       res.status(201).send('Created');
       return;
     }
 
-    if (method === 'MKCOL') {
-      fs.mkdirSync(targetFsPath, { recursive: true });
-      res.status(201).send('Directory Created');
-      return;
-    }
-
+    // DELETE
     if (method === 'DELETE') {
-      if (!fs.existsSync(targetFsPath)) {
+      if (isRoot) {
+        res.status(403).send('Cannot delete root collection');
+        return;
+      }
+      if (!fs.existsSync(fsPath)) {
         res.status(404).send('Not Found');
         return;
       }
-      fs.rmSync(targetFsPath, { recursive: true, force: true });
+      fs.rmSync(fsPath, { recursive: true, force: true });
       res.status(204).end();
       return;
     }
@@ -1372,26 +1230,60 @@ async function startServer() {
   });
 
   // ============================================================================
-  // 4. Authenticated App API Routes (/api/*)
+  // 5. Authenticated App API Routes (/api/*)
   // ============================================================================
   app.use('/api', requireAppAuth);
 
-  // Download ready-to-run Docker Compose ZIP file
-  app.get('/api/docker/download-zip', async (_req: Request, res: Response) => {
-    try {
-      const zipBuffer = await createDockerComposeZipBuffer();
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="vaultdav-docker-compose.zip"');
-      res.setHeader('Content-Length', zipBuffer.length);
-      res.end(zipBuffer);
-    } catch (err: any) {
-      console.error('Failed to generate zip:', err);
-      res.status(500).json({ error: 'Failed to create docker zip package: ' + err.message });
+  app.get('/api/state', (req: Request, res: Response) => {
+    const account = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
+    const sqliteTables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as {
+        name: string;
+      }[]
+    ).map((t) => t.name);
+
+    let decryptedWebdavPassword = '';
+    if (account && account.webdav_ciphertext_hex) {
+      try {
+        decryptedWebdavPassword = decryptSecret(
+          account.webdav_ciphertext_hex,
+          account.webdav_iv_hex,
+          account.webdav_auth_tag_hex
+        );
+      } catch {}
     }
+
+    const folders = readHostVolumesItems();
+    const { headers, webdavHost, webdavPort } = parseStackEnv();
+    const artifacts = generateStackArtifacts();
+    const detectedIp = getDetectedLocalIp();
+    const detectedHost = String(req.headers.host || `${detectedIp}:3000`);
+
+    res.json({
+      account,
+      webdavCredentials: {
+        username: account?.username || '',
+        password: decryptedWebdavPassword,
+        ciphertext_hex: account?.webdav_ciphertext_hex || '',
+        iv_hex: account?.webdav_iv_hex || '',
+        auth_tag_hex: account?.webdav_auth_tag_hex || '',
+      },
+      webdavHostConfig: {
+        domainOrIp: webdavHost,
+        port: webdavPort,
+        detectedIp,
+        detectedHost,
+      },
+      sqliteTables,
+      folders,
+      customHeaders: headers,
+      webdavUrl: '/dav/',
+      syncthingUrl: '/syncthing/',
+      artifacts,
+    });
   });
 
-  // Option to add TOTP 2FA later in Account Menu
-  app.post('/api/account/2fa/prepare', async (req: Request, res: Response) => {
+  app.post('/api/account/2fa/prepare', async (_req: Request, res: Response) => {
     const account = db.prepare('SELECT username FROM credentials WHERE id = 1').get() as any;
     if (!account) {
       res.status(404).json({ error: 'Account not found' });
@@ -1468,140 +1360,6 @@ async function startServer() {
     }
   });
 
-  app.get('/api/host-browser', (req: Request, res: Response) => {
-    const requestedPath = String(req.query.path || './host_volumes').trim();
-    let targetDir = path.isAbsolute(requestedPath)
-      ? path.normalize(requestedPath)
-      : path.resolve(__dirname, requestedPath);
-
-    if (!targetDir.startsWith(__dirname) || !fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
-      targetDir = HOST_VOLUMES_DIR;
-    }
-
-    const { folders } = parseStackEnv();
-    const hiddenSystemDirs = new Set(['node_modules', '.git', 'bin', 'dist', '.stfolder']);
-
-    const entries = fs
-      .readdirSync(targetDir, { withFileTypes: true })
-      .filter((e) => !hiddenSystemDirs.has(e.name))
-      .map((entry) => {
-        const entryAbs = path.join(targetDir, entry.name);
-        const relPath = toRelativeHostPath(entryAbs);
-        let size = 0;
-        try {
-          if (!entry.isDirectory()) {
-            size = fs.statSync(entryAbs).size;
-          }
-        } catch {}
-
-        const matchedFolder = folders.find(
-          (f) => resolveFolderAbsPath(f) === entryAbs
-        );
-
-        return {
-          name: entry.name,
-          path: entryAbs,
-          relativePath: relPath,
-          isDirectory: entry.isDirectory(),
-          size,
-          alreadyExposedSlug: matchedFolder ? matchedFolder.slug : null,
-        };
-      })
-      .sort((a, b) => {
-        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-
-    const parentAbs = path.dirname(targetDir);
-    const canGoUp = targetDir !== __dirname && parentAbs.startsWith(__dirname);
-
-    res.json({
-      currentPath: targetDir,
-      relativePath: toRelativeHostPath(targetDir),
-      parentPath: canGoUp ? toRelativeHostPath(parentAbs) : null,
-      entries,
-    });
-  });
-
-  app.post('/api/host-browser/mkdir', (req: Request, res: Response) => {
-    const parentRel = String(req.body.parentPath || './host_volumes').trim();
-    const folderName = String(req.body.name || '')
-      .trim()
-      .replace(/[^a-zA-Z0-9._-]/g, '_');
-    if (!folderName) {
-      res.status(400).json({ error: 'Folder name required' });
-      return;
-    }
-
-    const parentAbs = path.isAbsolute(parentRel)
-      ? path.normalize(parentRel)
-      : path.resolve(__dirname, parentRel);
-
-    if (!parentAbs.startsWith(__dirname)) {
-      res.status(403).json({ error: 'Invalid host directory' });
-      return;
-    }
-
-    const newDirAbs = path.join(parentAbs, folderName);
-    fs.mkdirSync(newDirAbs, { recursive: true });
-    res.status(201).json({
-      ok: true,
-      relativePath: toRelativeHostPath(newDirAbs),
-      name: folderName,
-    });
-  });
-
-  app.get('/api/state', (req: Request, res: Response) => {
-    const account = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
-    const sqliteTables = (
-      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as {
-        name: string;
-      }[]
-    ).map((t) => t.name);
-
-    let decryptedWebdavPassword = '';
-    if (account && account.webdav_ciphertext_hex) {
-      try {
-        decryptedWebdavPassword = decryptSecret(
-          account.webdav_ciphertext_hex,
-          account.webdav_iv_hex,
-          account.webdav_auth_tag_hex
-        );
-      } catch {}
-    }
-
-    const folders = readFilesystemFoldersWithStats();
-    const { headers, webdavHost, webdavPort } = parseStackEnv();
-    const artifacts = generateStackArtifacts();
-    const detectedIp = getDetectedLocalIp();
-    const detectedHost = String(req.headers.host || `${detectedIp}:3000`);
-
-    res.json({
-      account,
-      webdavCredentials: {
-        username: account?.username || '', // Strictly the SAME username used for login
-        password: decryptedWebdavPassword,
-        ciphertext_hex: account?.webdav_ciphertext_hex || '',
-        iv_hex: account?.webdav_iv_hex || '',
-        auth_tag_hex: account?.webdav_auth_tag_hex || '',
-      },
-      webdavHostConfig: {
-        domainOrIp: webdavHost,
-        port: webdavPort,
-        detectedIp,
-        detectedHost,
-      },
-      sqliteTables,
-      folders,
-      customHeaders: headers,
-      webdavUrl: '/dav/',
-      syncthingUrl: '/syncthing/',
-      artifacts,
-    });
-  });
-
-  // Auto-generate safe WebDAV password on the main app (username remains identical to login username!)
-  // All credentials saved in SQLite
   app.post('/api/webdav-credentials/regenerate', (_req: Request, res: Response) => {
     const account = db.prepare('SELECT * FROM credentials WHERE id = 1').get() as any;
     if (!account) {
@@ -1621,7 +1379,7 @@ async function startServer() {
     res.json({
       ok: true,
       webdavCredentials: {
-        username: account.username, // Strictly the same as login username
+        username: account.username,
         password: nextSafePassword,
         ciphertext_hex: encDav.ciphertextHex,
         iv_hex: encDav.ivHex,
@@ -1630,122 +1388,68 @@ async function startServer() {
     });
   });
 
-  // Configure Domain Name or IP Address for WebDAV in .env
   app.put('/api/webdav-host', async (req: Request, res: Response) => {
     const domainOrIp = String(req.body?.domainOrIp || '').trim() || getDetectedLocalIp();
     const port = String(req.body?.port || '8080').trim() || '8080';
-    const { folders, headers } = parseStackEnv();
-    writeStackEnv(folders, headers, domainOrIp, port);
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
+    const { headers } = parseStackEnv();
+    writeStackEnv(headers, domainOrIp, port);
     res.json({ ok: true, domainOrIp, port });
   });
 
-  app.put('/api/folders/:slug', async (req: Request, res: Response) => {
-    const slug = String(req.params.slug || '').toUpperCase();
-    const { folders, headers } = parseStackEnv();
-    const target = folders.find((f) => f.slug === slug);
-    if (!target) {
-      res.status(404).json({ error: 'Folder not found in .env' });
-      return;
-    }
-
-    if (req.body.exposed !== undefined) target.exposed = Boolean(req.body.exposed);
-    if (req.body.syncthing_enabled !== undefined) target.syncthing_enabled = Boolean(req.body.syncthing_enabled);
-
-    writeStackEnv(folders, headers);
-    await syncFoldersToRunningSyncthing();
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
-    res.json({ ok: true });
-  });
-
-  app.post('/api/folders', async (req: Request, res: Response) => {
-    const rawSlug = String(req.body.slug || '')
-      .trim()
-      .toUpperCase()
-      .replace(/[^A-Z0-9_]/g, '_');
-    if (!rawSlug) {
+  // Host folder operations inside ./host_volumes
+  app.post('/api/folders', (req: Request, res: Response) => {
+    const rawName = String(req.body.name || req.body.slug || '').trim();
+    const cleanName = path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (!cleanName) {
       res.status(400).json({ error: 'Folder name required' });
       return;
     }
-
-    const { folders, headers } = parseStackEnv();
-    if (folders.some((f) => f.slug === rawSlug)) {
-      res.status(400).json({ error: 'Folder already exists in .env' });
-      return;
-    }
-
-    const rawHostPath = String(req.body.host_path || `./host_volumes/${rawSlug.toLowerCase()}`).trim();
-
-    folders.push({
-      slug: rawSlug,
-      exposed: true,
-      syncthing_enabled: true,
-      host_path: rawHostPath,
-      container_path: `/var/webdav/${rawSlug.toLowerCase()}`,
-    });
-
-    writeStackEnv(folders, headers);
-    ensureFilesystemFolders();
-    await syncFoldersToRunningSyncthing();
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
-    res.status(201).json({ ok: true });
+    const targetDir = path.join(HOST_VOLUMES_DIR, cleanName);
+    fs.mkdirSync(targetDir, { recursive: true });
+    res.status(201).json({ ok: true, name: cleanName });
   });
 
-  app.delete('/api/folders/:slug', async (req: Request, res: Response) => {
-    const slug = String(req.params.slug || '').toUpperCase();
-    const { folders, headers } = parseStackEnv();
-    const filtered = folders.filter((f) => f.slug !== slug);
-    writeStackEnv(filtered, headers);
-    await syncFoldersToRunningSyncthing();
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
+  app.delete('/api/folders/:name', (req: Request, res: Response) => {
+    const name = path.basename(String(req.params.name || '').trim());
+    if (!name) {
+      res.status(400).json({ error: 'Folder name required' });
+      return;
+    }
+    const targetDir = path.join(HOST_VOLUMES_DIR, name);
+    if (fs.existsSync(targetDir)) {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
     res.json({ ok: true });
   });
 
-  app.post('/api/headers', async (req: Request, res: Response) => {
+  app.post('/api/headers', (req: Request, res: Response) => {
     const headerName = String(req.body.header_name || '').trim();
     const headerValue = String(req.body.header_value || '').trim();
     if (!headerName || !headerValue) {
       res.status(400).json({ error: 'Header name and value required' });
       return;
     }
-    const { folders, headers } = parseStackEnv();
+    const { headers } = parseStackEnv();
     headers.push({ header_name: headerName, header_value: headerValue, enabled: true });
-    writeStackEnv(folders, headers);
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
+    writeStackEnv(headers);
     res.status(201).json({ ok: true });
   });
 
-  app.put('/api/headers/:index', async (req: Request, res: Response) => {
+  app.put('/api/headers/:index', (req: Request, res: Response) => {
     const idx = Number(req.params.index);
-    const { folders, headers } = parseStackEnv();
+    const { headers } = parseStackEnv();
     if (headers[idx]) {
       headers[idx].enabled = Boolean(req.body.enabled);
-      writeStackEnv(folders, headers);
-      try {
-        await createDockerComposeZipBuffer();
-      } catch {}
+      writeStackEnv(headers);
     }
     res.json({ ok: true });
   });
 
-  app.delete('/api/headers/:index', async (req: Request, res: Response) => {
+  app.delete('/api/headers/:index', (req: Request, res: Response) => {
     const idx = Number(req.params.index);
-    const { folders, headers } = parseStackEnv();
+    const { headers } = parseStackEnv();
     headers.splice(idx, 1);
-    writeStackEnv(folders, headers);
-    try {
-      await createDockerComposeZipBuffer();
-    } catch {}
+    writeStackEnv(headers);
     res.json({ ok: true });
   });
 
@@ -1785,6 +1489,10 @@ async function startServer() {
   const PORT = 3000;
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`VaultDAV Server + Native Syncthing Proxy listening on http://0.0.0.0:${PORT}`);
+    // Pre-generate static zip archive for instant docker-compose download
+    createDockerComposeZipBuffer().catch((err) => {
+      console.warn('Initial docker-compose.zip generation error:', err);
+    });
   });
 }
 

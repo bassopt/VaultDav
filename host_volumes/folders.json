@@ -1,0 +1,40 @@
+{
+  "folders": [
+    {
+      "slug": "DOCUMENTS",
+      "folder_name": "documents",
+      "exposed": true,
+      "syncthing_enabled": true
+    },
+    {
+      "slug": "PROJECTS",
+      "folder_name": "projects",
+      "exposed": true,
+      "syncthing_enabled": true
+    },
+    {
+      "slug": "MEDIA",
+      "folder_name": "media",
+      "exposed": true,
+      "syncthing_enabled": true
+    },
+    {
+      "slug": "BACKUPS",
+      "folder_name": "backups",
+      "exposed": false,
+      "syncthing_enabled": false
+    },
+    {
+      "slug": "PHOTOS",
+      "folder_name": "photos",
+      "exposed": false,
+      "syncthing_enabled": false
+    },
+    {
+      "slug": "SHARED_NOTES",
+      "folder_name": "shared_notes",
+      "exposed": true,
+      "syncthing_enabled": true
+    }
+  ]
+}

@@ -11,8 +11,8 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-# Create default directories for SQLite and WebDAV mounts
-RUN mkdir -p /data/db /var/webdav/documents /var/webdav/media /var/webdav/projects /var/webdav/backups /var/webdav/photos
+# Create default directories for SQLite and single host_volumes mount
+RUN mkdir -p /data/db /var/webdav
 
 EXPOSE 3000
 

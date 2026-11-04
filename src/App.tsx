@@ -238,15 +238,19 @@ export default function App() {
     async (
       pathUrl: string,
       method: string,
-      body?: string,
+      body?: BodyInit | null,
       overrideUser?: string,
-      overridePass?: string
+      overridePass?: string,
+      contentType?: string
     ) => {
       const user = overrideUser !== undefined ? overrideUser : davLoginUser;
       const pass = overridePass !== undefined ? overridePass : davLoginPass;
       const headers: Record<string, string> = {
         Authorization: `Basic ${btoa(`${user}:${pass}`)}`,
       };
+      if (contentType) {
+        headers['Content-Type'] = contentType;
+      }
       if (method === 'PROPFIND') {
         headers['Depth'] = '1';
       }
@@ -272,12 +276,10 @@ export default function App() {
 
   const loadWebdavDirectory = useCallback(
     async (
-      slug = davMountSlug,
       sub = davSubPath,
       user?: string,
       pass?: string
     ) => {
-      if (!slug) return false;
       setDavLoading(true);
       setDavAuthError(null);
       try {
@@ -285,10 +287,11 @@ export default function App() {
         const encodedSub = cleanSub
           ? cleanSub
               .split('/')
+              .filter(Boolean)
               .map((s) => encodeURIComponent(s))
               .join('/') + '/'
           : '';
-        const href = `/dav/${slug.toLowerCase()}/${encodedSub}`;
+        const href = `/dav/${encodedSub}`;
         const res = await fetchWebdav(href, 'PROPFIND', undefined, user, pass);
 
         if (res.status === 401) {
@@ -315,14 +318,14 @@ export default function App() {
         setDavLoading(false);
       }
     },
-    [davMountSlug, davSubPath, fetchWebdav]
+    [davSubPath, fetchWebdav]
   );
 
   useEffect(() => {
     if (activeTab === 'webdav_app' && davAuthed) {
-      loadWebdavDirectory(davMountSlug, davSubPath);
+      loadWebdavDirectory(davSubPath);
     }
-  }, [activeTab, davAuthed, davMountSlug, davSubPath, loadWebdavDirectory]);
+  }, [activeTab, davAuthed, davSubPath, loadWebdavDirectory]);
 
   // Auth Submission: Register requires ONLY Username and Password.
   // Sign In requires TOTP only if 2FA has been enabled on the account.
@@ -439,7 +442,7 @@ export default function App() {
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
       }
     } finally {
       setDownloadingZip(false);
@@ -597,15 +600,15 @@ export default function App() {
   // =========================================================================
   const handleWebdavLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    await loadWebdavDirectory(davMountSlug, davSubPath, davLoginUser, davLoginPass);
+    await loadWebdavDirectory(davSubPath, davLoginUser, davLoginPass);
   };
 
   const buildDavTargetUrl = (itemName?: string, isDir = false) => {
     const cleanSub = davSubPath.replace(/^\/+|\/+$/g, '');
-    const parts = cleanSub ? cleanSub.split('/') : [];
+    const parts = cleanSub ? cleanSub.split('/').filter(Boolean) : [];
     if (itemName) parts.push(itemName);
     const encoded = parts.map((p) => encodeURIComponent(p)).join('/');
-    return `/dav/${davMountSlug.toLowerCase()}/${encoded}${isDir && encoded ? '/' : ''}`;
+    return `/dav/${encoded}${isDir && encoded ? '/' : ''}`;
   };
 
   const handleOpenDavEntry = async (entry: WebdavEntry) => {
@@ -618,8 +621,30 @@ export default function App() {
 
     const res = await fetchWebdav(buildDavTargetUrl(entry.name), 'GET');
     if (res.ok) {
-      const content = await res.text();
-      setSelectedFile({ name: entry.name, content });
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      const isTextLike =
+        contentType.startsWith('text/') ||
+        contentType.includes('json') ||
+        contentType.includes('xml') ||
+        contentType.includes('yaml') ||
+        contentType.includes('javascript') ||
+        /\.(txt|md|json|xml|yml|yaml|csv|html|css|js|ts|tsx|env|conf|ini|sh)$/i.test(entry.name);
+
+      if (isTextLike) {
+        const content = await res.text();
+        setSelectedFile({ name: entry.name, content });
+      } else {
+        // Binary file: trigger direct binary download without UTF-8 text corruption
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = entry.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      }
     }
   };
 
@@ -628,7 +653,10 @@ export default function App() {
     const res = await fetchWebdav(
       buildDavTargetUrl(selectedFile.name),
       'PUT',
-      selectedFile.content
+      selectedFile.content,
+      undefined,
+      undefined,
+      'text/plain; charset=utf-8'
     );
     if (res.ok) {
       await loadWebdavDirectory();
@@ -641,7 +669,14 @@ export default function App() {
     if (!newDavFileName.trim()) return;
     const fileName = newDavFileName.trim();
     const initialContent = `# ${fileName}\n\n`;
-    const res = await fetchWebdav(buildDavTargetUrl(fileName), 'PUT', initialContent);
+    const res = await fetchWebdav(
+      buildDavTargetUrl(fileName),
+      'PUT',
+      initialContent,
+      undefined,
+      undefined,
+      'text/plain; charset=utf-8'
+    );
     if (res.ok) {
       setNewDavFileName('');
       setCreatingFile(false);
@@ -677,8 +712,15 @@ export default function App() {
   const handleUploadDavFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const text = await file.text();
-    const res = await fetchWebdav(buildDavTargetUrl(file.name), 'PUT', text);
+    const rawBuffer = await file.arrayBuffer();
+    const res = await fetchWebdav(
+      buildDavTargetUrl(file.name),
+      'PUT',
+      rawBuffer,
+      undefined,
+      undefined,
+      file.type || 'application/octet-stream'
+    );
     if (res.ok) {
       await loadWebdavDirectory();
       await checkAuthAndLoad();
@@ -739,7 +781,7 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   };
 
   if (loading) {
@@ -864,7 +906,7 @@ export default function App() {
   const exposedFolders = state.folders.filter((f) => f.exposed);
 
   const browserOrigin = typeof window !== 'undefined' ? window.location.origin : `http://${state.webdavHostConfig.detectedHost}`;
-  const activeMountPath = `/dav/${davMountSlug.toLowerCase()}/`;
+  const activeMountPath = '/dav/';
   const domainDavUrl = `${browserOrigin}${activeMountPath}`;
   const configuredHost = state.webdavHostConfig.domainOrIp || state.webdavHostConfig.detectedIp;
   const configuredPort = state.webdavHostConfig.port || '8080';
@@ -1402,13 +1444,18 @@ export default function App() {
            =================================================================== */}
         {activeTab === 'folders' && (
           <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-5">
-            <div>
-              <h2 className="text-base font-semibold text-zinc-100">
-                Exposed Host Folders (.env)
-              </h2>
-              <p className="text-xs text-zinc-400 mt-0.5">
-                Configured in <code className="font-mono">.env</code> and shared between WebDAV and Syncthing.
-              </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-zinc-800/80">
+              <div>
+                <h2 className="text-base font-semibold text-zinc-100">
+                  Host Volumes Folder (./host_volumes)
+                </h2>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Only <code className="font-mono text-blue-400">./host_volumes</code> is exposed in <code className="font-mono">.env</code> &amp; <code className="font-mono">docker-compose.yml</code>. All subfolders are configured inside <code className="font-mono">./host_volumes/folders.json</code>.
+                </p>
+              </div>
+              <div className="px-3 py-1.5 bg-[#050507] border border-zinc-800 rounded text-xs font-mono text-zinc-300 shrink-0">
+                Mount: <span className="text-blue-400">./host_volumes → /var/webdav</span>
+              </div>
             </div>
 
             <div className="divide-y divide-zinc-800/80">
@@ -1434,41 +1481,18 @@ export default function App() {
                   <div className="flex items-center gap-2 shrink-0">
                     <button
                       onClick={() => {
-                        setDavMountSlug(folder.slug);
-                        setDavSubPath('');
+                        setDavSubPath(folder.slug.toLowerCase());
                         setActiveTab('webdav_app');
                       }}
-                      className="px-2.5 py-1.5 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md"
+                      className="px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-md transition-colors"
                     >
-                      Open DAV
+                      Open in WebDAV
                     </button>
 
                     <button
-                      onClick={() => handleToggleFolder(folder, 'exposed')}
-                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                        folder.exposed
-                          ? 'bg-blue-600 text-white hover:bg-blue-500'
-                          : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 border border-zinc-800'
-                      }`}
-                    >
-                      {folder.exposed ? 'Exposed' : 'Hidden'}
-                    </button>
-
-                    <button
-                      onClick={() => handleToggleFolder(folder, 'syncthing_enabled')}
-                      className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                        folder.syncthing_enabled && folder.exposed
-                          ? 'bg-zinc-900 text-blue-400 border border-blue-500/40'
-                          : 'bg-zinc-900/60 text-zinc-500 hover:text-zinc-300 border border-zinc-800/80'
-                      }`}
-                    >
-                      Syncthing {folder.syncthing_enabled ? 'On' : 'Off'}
-                    </button>
-
-                    <button
-                      onClick={() => handleDeleteFolder(folder.slug)}
+                      onClick={() => handleDeleteFolder(folder.slug.toLowerCase())}
                       className="p-1.5 text-zinc-500 hover:text-red-400 rounded-md"
-                      title="Remove from .env"
+                      title="Delete folder from ./host_volumes"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -1477,166 +1501,28 @@ export default function App() {
               ))}
             </div>
 
-            {/* Add Folder to .env Form with Small Folder Browser Picker */}
+            {/* Create Folder inside ./host_volumes Form */}
             <div className="pt-4 border-t border-zinc-800/80 space-y-3">
               <form
-                onSubmit={(e) => {
-                  handleAddFolder(e);
-                  setShowHostBrowser(false);
-                }}
-                className="flex flex-col sm:flex-row gap-2"
+                onSubmit={handleAddFolder}
+                className="flex gap-2"
               >
                 <input
                   type="text"
                   required
-                  placeholder="Folder Name (e.g. BACKUPS)"
+                  placeholder="New Folder Name inside ./host_volumes (e.g. documents, media, backups)"
                   value={newSlug}
                   onChange={(e) => setNewSlug(e.target.value)}
-                  className="sm:w-48 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
+                  className="flex-1 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
                 />
-
-                <div className="flex-1 flex gap-1.5">
-                  <input
-                    type="text"
-                    placeholder="Host path (click Browse to choose or create folder)"
-                    value={newHostPath}
-                    onChange={(e) => setNewHostPath(e.target.value)}
-                    className="flex-1 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const next = !showHostBrowser;
-                      setShowHostBrowser(next);
-                      if (next && !hostBrowserData) {
-                        loadHostBrowser('./host_volumes');
-                      }
-                    }}
-                    className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors shrink-0 ${
-                      showHostBrowser
-                        ? 'bg-blue-600/20 text-blue-300 border-blue-500/40'
-                        : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border-zinc-800'
-                    }`}
-                  >
-                    <Folder className="w-3.5 h-3.5" />
-                    Browse...
-                  </button>
-                </div>
-
                 <button
                   type="submit"
                   className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold bg-blue-600 text-white rounded-md hover:bg-blue-500 whitespace-nowrap shrink-0"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Add to .env
+                  Create Folder
                 </button>
               </form>
-
-              {/* Small Inline Host Folder Picker (with option to create a new folder) */}
-              {showHostBrowser && (
-                <div className="p-3 bg-[#050507] border border-zinc-800 rounded-md space-y-2.5 max-w-xl">
-                  <div className="flex items-center justify-between gap-2 text-xs font-mono">
-                    <span className="text-zinc-400 truncate">
-                      Path:{' '}
-                      <strong className="text-blue-400">
-                        {hostBrowserData?.relativePath || './host_volumes'}
-                      </strong>
-                    </span>
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      {hostBrowserData?.parentPath && (
-                        <button
-                          type="button"
-                          onClick={() => loadHostBrowser(hostBrowserData.parentPath!)}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded"
-                        >
-                          <ArrowUp className="w-3 h-3" />
-                          Up
-                        </button>
-                      )}
-                      {hostBrowserData && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const rel = hostBrowserData.relativePath;
-                            const dirName = rel.split('/').pop() || 'SHARE';
-                            setNewHostPath(rel);
-                            if (!newSlug.trim() && dirName !== '.' && dirName !== 'host_volumes') {
-                              setNewSlug(dirName.toUpperCase().replace(/[^A-Z0-9_]/g, '_'));
-                            }
-                            setShowHostBrowser(false);
-                          }}
-                          className="px-2 py-0.5 bg-blue-600 text-white font-sans font-semibold rounded hover:bg-blue-500"
-                        >
-                          Use Current Path
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="divide-y divide-zinc-800/70 max-h-44 overflow-y-auto border border-zinc-900 rounded">
-                    {hostBrowserLoading ? (
-                      <div className="p-2.5 text-xs font-mono text-zinc-500">
-                        Loading folders...
-                      </div>
-                    ) : (
-                      hostBrowserData?.entries
-                        .filter((e) => e.isDirectory)
-                        .map((entry) => (
-                          <div
-                            key={entry.relativePath}
-                            className="px-2.5 py-1.5 flex items-center justify-between gap-2 hover:bg-zinc-900/70"
-                          >
-                            <button
-                              type="button"
-                              onClick={() => loadHostBrowser(entry.relativePath)}
-                              className="flex items-center gap-2 text-xs font-mono text-zinc-200 hover:text-blue-400 truncate text-left"
-                            >
-                              <Folder className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                              <span className="truncate">{entry.name}/</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setNewHostPath(entry.relativePath);
-                                if (!newSlug.trim()) {
-                                  setNewSlug(
-                                    entry.name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
-                                  );
-                                }
-                                setShowHostBrowser(false);
-                              }}
-                              className="px-2 py-0.5 text-[11px] font-semibold bg-zinc-900 hover:bg-blue-600 hover:text-white text-zinc-200 border border-zinc-800 rounded shrink-0 transition-colors"
-                            >
-                              Select
-                            </button>
-                          </div>
-                        ))
-                    )}
-                  </div>
-
-                  {/* Option to create a new folder directly inside the .env file browser */}
-                  <form
-                    onSubmit={handleCreateHostDirectoryInBrowser}
-                    className="flex gap-1.5 pt-1"
-                  >
-                    <input
-                      type="text"
-                      placeholder="New folder name..."
-                      value={newHostDirName}
-                      onChange={(e) => setNewHostDirName(e.target.value)}
-                      className="flex-1 px-2.5 py-1 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
-                    />
-                    <button
-                      type="submit"
-                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded shrink-0"
-                    >
-                      <FolderPlus className="w-3.5 h-3.5" />
-                      New Folder
-                    </button>
-                  </form>
-                </div>
-              )}
             </div>
           </section>
         )}
@@ -1650,7 +1536,7 @@ export default function App() {
             <div className="px-6 py-4 border-b border-zinc-800/80 flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h2 className="text-base font-semibold text-zinc-100">
-                  WebDAV File Manager (/dav/{davMountSlug.toLowerCase()}/)
+                  WebDAV File Manager (/dav/)
                 </h2>
                 <p className="text-xs font-mono text-zinc-400 mt-0.5">
                   Endpoint: <span className="text-blue-400">{domainDavUrl}</span> ·{' '}
@@ -1849,27 +1735,39 @@ export default function App() {
             ) : (
               /* Real Authenticated WebDAV File Manager UI */
               <div className="grid grid-cols-1 md:grid-cols-12 min-h-[480px]">
-                {/* Left Sidebar: Exposed .env Mounts */}
+                {/* Left Sidebar: Host Volumes Subfolders */}
                 <aside className="md:col-span-3 border-r border-zinc-800/80 bg-[#07080a] p-4 space-y-3">
                   <div className="text-xs font-mono uppercase tracking-wider text-zinc-500">
-                    Mounts
+                    Host Volumes
                   </div>
                   <div className="space-y-1">
-                    {exposedFolders.map((f) => (
+                    <button
+                      onClick={() => {
+                        setDavSubPath('');
+                        setSelectedFile(null);
+                      }}
+                      className={`w-full px-3 py-2 rounded-md text-left text-xs font-mono flex items-center justify-between transition-colors ${
+                        davSubPath === ''
+                          ? 'bg-blue-600 text-white font-semibold'
+                          : 'text-zinc-300 hover:bg-zinc-900'
+                      }`}
+                    >
+                      <span className="truncate">📁 /dav/ (Root)</span>
+                    </button>
+                    {state.folders.map((f) => (
                       <button
                         key={f.slug}
                         onClick={() => {
-                          setDavMountSlug(f.slug);
-                          setDavSubPath('');
+                          setDavSubPath(f.slug.toLowerCase());
                           setSelectedFile(null);
                         }}
                         className={`w-full px-3 py-2 rounded-md text-left text-xs font-mono flex items-center justify-between transition-colors ${
-                          davMountSlug === f.slug
-                            ? 'bg-blue-600 text-white font-semibold'
-                            : 'text-zinc-300 hover:bg-zinc-900'
+                          davSubPath === f.slug.toLowerCase() || davSubPath.startsWith(f.slug.toLowerCase() + '/')
+                            ? 'bg-blue-600/30 text-blue-300 border border-blue-500/40 font-semibold'
+                            : 'text-zinc-400 hover:bg-zinc-900'
                         }`}
                       >
-                        <span className="truncate">/dav/{f.slug.toLowerCase()}/</span>
+                        <span className="truncate">/{f.slug.toLowerCase()}/</span>
                         <span className="text-[11px] opacity-80">{f.fileCount}</span>
                       </button>
                     ))}
@@ -1897,7 +1795,7 @@ export default function App() {
                           </button>
                         )}
                         <span className="text-blue-400">
-                          /dav/{davMountSlug.toLowerCase()}/{davSubPath ? `${davSubPath}/` : ''}
+                          /dav/{davSubPath ? `${davSubPath}/` : ''}
                         </span>
                       </div>
 

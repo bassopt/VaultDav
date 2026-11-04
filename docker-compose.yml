@@ -1,6 +1,6 @@
 # Docker Compose — VaultDAV + Syncthing Stack
 # SQLite (/data/db/vaultdav.sqlite) is used strictly for encrypted credentials.
-# Folders and unencrypted files are mounted directly via .env into both containers.
+# Only ./host_volumes is exposed to both containers; all subfolders are configured inside ./host_volumes.
 
 services:
   vaultdav:
@@ -16,12 +16,13 @@ services:
     environment:
       - ENCRYPT_BRIDGED_FILES=false
       - WEBDAV_HOST=${WEBDAV_HOST:-0.0.0.0}
+      - SQLITE_DB_PATH=/data/db/vaultdav.sqlite
+      - HOST_VOLUMES_DIR=/var/webdav
+      - SYNCTHING_URL=http://syncthing:8384
     volumes:
       - ./data/db:/data/db
-      # Host Folders Exposed via .env (Unencrypted on disk)
-      - ${HOST_PATH_DOCUMENTS:-./host_volumes/documents}:${CONTAINER_PATH_DOCUMENTS:-/var/webdav/documents}:rw
-      - ${HOST_PATH_PROJECTS:-./host_volumes/projects}:${CONTAINER_PATH_PROJECTS:-/var/webdav/projects}:rw
-      - ${HOST_PATH_MEDIA:-./host_volumes/media}:${CONTAINER_PATH_MEDIA:-/var/webdav/media}:rw
+      # Single exposed host_volumes folder
+      - ${HOST_VOLUMES_PATH:-./host_volumes}:/var/webdav:rw
     networks:
       - vaultdav_net
 
@@ -43,10 +44,8 @@ services:
       - "21027:21027/udp"
     volumes:
       - ./data/syncthing-config:/config
-      # Identical Unencrypted Host Folders Mounted into Syncthing
-      - ${HOST_PATH_DOCUMENTS:-./host_volumes/documents}:${CONTAINER_PATH_DOCUMENTS:-/var/webdav/documents}:rw
-      - ${HOST_PATH_PROJECTS:-./host_volumes/projects}:${CONTAINER_PATH_PROJECTS:-/var/webdav/projects}:rw
-      - ${HOST_PATH_MEDIA:-./host_volumes/media}:${CONTAINER_PATH_MEDIA:-/var/webdav/media}:rw
+      # Single exposed host_volumes folder
+      - ${HOST_VOLUMES_PATH:-./host_volumes}:/var/webdav:rw
     networks:
       - vaultdav_net
 
