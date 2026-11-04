@@ -40,7 +40,9 @@ export interface WebdavCredentialsInfo {
 
 export interface WebdavHostConfig {
   domainOrIp: string;
-  port: string;
+  port: string; // legacy compatibility
+  webAppPort: string;
+  webdavPort: string;
   detectedIp: string;
   detectedHost: string;
 }

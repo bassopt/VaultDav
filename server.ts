@@ -330,6 +330,7 @@ interface CustomHeaderItem {
 function parseStackEnv(): {
   headers: CustomHeaderItem[];
   webdavHost: string;
+  webAppPort: string;
   webdavPort: string;
 } {
   let raw = '';
@@ -369,19 +370,22 @@ function parseStackEnv(): {
 
   const rawHost = map['WEBDAV_HOST'] || getDetectedLocalIp();
   const webdavHost = rawHost.startsWith('169.254.') ? '0.0.0.0' : rawHost;
-  const webdavPort = map['WEBDAV_PORT'] || '8080';
+  const webAppPort = map['WEB_APP_PORT'] || '8080';
+  const webdavPort = map['WEBDAV_PORT'] || map['PORT'] || '8081';
 
-  return { headers, webdavHost, webdavPort };
+  return { headers, webdavHost, webAppPort, webdavPort };
 }
 
 function writeStackEnv(
   headers: CustomHeaderItem[],
   webdavHost?: string,
+  webAppPort?: string,
   webdavPort?: string
 ) {
   const current = parseStackEnv();
   const finalHost = webdavHost !== undefined ? webdavHost : current.webdavHost;
-  const finalPort = webdavPort !== undefined ? webdavPort : current.webdavPort;
+  const finalWebAppPort = webAppPort !== undefined ? webAppPort : current.webAppPort;
+  const finalWebdavPort = webdavPort !== undefined ? webdavPort : current.webdavPort;
 
   const serializedHeaders = headers
     .map((h) => `${h.header_name}:${h.header_value}|${h.enabled ? '1' : '0'}`)
@@ -392,10 +396,15 @@ function writeStackEnv(
     'PUID=1000',
     'PGID=1000',
     'TZ=UTC',
-    `WEBDAV_HOST="${finalHost}"`,
-    `WEBDAV_PORT=${finalPort}`,
+    '',
+    '# Dedicated Host Ports (Different ports for Web App and WebDAV)',
+    `WEB_APP_PORT=${finalWebAppPort}`,
+    `WEBDAV_PORT=${finalWebdavPort}`,
     'SYNCTHING_GUI_PORT=8384',
     'SYNCTHING_SYNC_PORT=22000',
+    '',
+    '# WebDAV External Host/IP Configuration',
+    `WEBDAV_HOST="${finalHost}"`,
     '',
     '# SQLite Credential Store Encryption (SQLite is used ONLY for credentials)',
     `SQLITE_MASTER_KEY="${MASTER_SECRET}"`,
@@ -566,8 +575,8 @@ function startLocalSyncthingDaemon() {
 }
 
 function generateStackArtifacts() {
-  const { headers, webdavHost, webdavPort } = parseStackEnv();
-  const envContent = writeStackEnv(headers, webdavHost, webdavPort);
+  const { headers, webdavHost, webAppPort, webdavPort } = parseStackEnv();
+  const envContent = writeStackEnv(headers, webdavHost, webAppPort, webdavPort);
 
   const composeContent = `# Docker Compose — VaultDAV + Syncthing Stack
 # SQLite (/data/db/vaultdav.sqlite) is used strictly for encrypted credentials.
@@ -581,12 +590,15 @@ services:
     container_name: vaultdav-server
     restart: unless-stopped
     ports:
-      - "\${WEBDAV_PORT:-8080}:3000"
+      - "\${WEB_APP_PORT:-8080}:3000"
+      - "\${WEBDAV_PORT:-8081}:3001"
     env_file:
       - .env
     environment:
       - ENCRYPT_BRIDGED_FILES=false
       - WEBDAV_HOST=\${WEBDAV_HOST:-0.0.0.0}
+      - WEB_APP_PORT=\${WEB_APP_PORT:-8080}
+      - WEBDAV_PORT=\${WEBDAV_PORT:-8081}
       - SQLITE_DB_PATH=/data/db/vaultdav.sqlite
       - HOST_VOLUMES_DIR=/var/webdav
       - SYNCTHING_URL=http://syncthing:8384
@@ -641,7 +653,8 @@ RUN npm run build
 # Create persistent directories for SQLite database and single host_volumes mount
 RUN mkdir -p /data/db /var/webdav
 
-EXPOSE 3000
+# Expose Web App (3000) and dedicated WebDAV Server (3001)
+EXPOSE 3000 3001
 
 CMD ["npm", "run", "start"]
 `;
@@ -668,7 +681,7 @@ function addDirectoryToZip(zip: JSZip, fsDirPath: string, zipDirPath: string) {
 async function createDockerComposeZipBuffer(): Promise<Buffer> {
   const zip = new JSZip();
   const artifacts = generateStackArtifacts();
-  const { webdavHost, webdavPort } = parseStackEnv();
+  const { webdavHost, webAppPort, webdavPort } = parseStackEnv();
 
   // Root stack orchestration files (prefer current files on disk to preserve any manual edits)
   const composePath = path.join(__dirname, 'docker-compose.yml');
@@ -732,9 +745,11 @@ docker compose up -d --build
 
 ## Access Endpoints
 
-- **VaultDAV & WebDAV**:
-  - Web UI: http://localhost:${webdavPort} (or http://${webdavHost}:${webdavPort})
-  - WebDAV Root Endpoint: http://localhost:${webdavPort}/dav/
+- **VaultDAV Web App & Admin Dashboard (Port ${webAppPort})**:
+  - Web UI: http://localhost:${webAppPort} (or http://${webdavHost}:${webAppPort})
+- **Dedicated RFC 4918 WebDAV Server (Port ${webdavPort})**:
+  - WebDAV Root Endpoint: http://localhost:${webdavPort}/ (or http://${webdavHost}:${webdavPort}/)
+  - Also compatible at: http://localhost:${webdavPort}/dav/
 - **Native Syncthing Web GUI**:
   - Web UI: http://localhost:8384
   - Synchronization Port: 22000 (TCP/UDP)
@@ -897,6 +912,8 @@ async function startServer() {
     }
   };
   app.get('/api/docker/download-zip', handleZipDownload);
+  app.get('/api/docker-compose/zip', handleZipDownload);
+  app.get('/api/docker-compose.zip', handleZipDownload);
   app.get('/vaultdav-docker-compose.zip', handleZipDownload);
 
   // Raw binary body parser for WebDAV (/dav)
@@ -997,9 +1014,9 @@ async function startServer() {
   // ============================================================================
   const applyWebdavHeadersAndAuth = (req: Request, res: Response) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Depth, Overwrite, Destination, Content-Type, X-Requested-With, *');
-    res.setHeader('Access-Control-Expose-Headers', 'DAV, Allow, X-Received-Custom-Headers');
+    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK, PROPPATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Depth, Overwrite, Destination, Content-Type, If, Timeout, Lock-Token, Range, X-Requested-With, *');
+    res.setHeader('Access-Control-Expose-Headers', 'DAV, Allow, Lock-Token, Content-Range, Accept-Ranges, ETag, X-Received-Custom-Headers');
 
     const { headers } = parseStackEnv();
     for (const h of headers.filter((x) => x.enabled)) {
@@ -1010,7 +1027,8 @@ async function startServer() {
 
     if (req.method.toUpperCase() === 'OPTIONS') {
       res.setHeader('DAV', '1, 2');
-      res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY');
+      res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK, PROPPATCH');
+      res.setHeader('MS-Author-Via', 'DAV');
       res.status(200).end();
       return { handled: true };
     }
@@ -1025,10 +1043,10 @@ async function startServer() {
     return { handled: false };
   };
 
-  // Helper to map /dav request path to filesystem inside HOST_VOLUMES_DIR
+  // Helper to map request path to filesystem inside HOST_VOLUMES_DIR
   function resolveWebdavPath(reqUrl: string): { fsPath: string; relPath: string; isRoot: boolean } | null {
     const rawPath = reqUrl.split('?')[0];
-    const stripped = rawPath.replace(/^\/dav\/?/, '');
+    const stripped = rawPath.replace(/^\/dav\/?/, '').replace(/^\/+/, '');
     const decoded = decodeURIComponent(stripped);
     const normalized = path.normalize(decoded).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^\/+/, '');
     const fsPath = path.resolve(HOST_VOLUMES_DIR, normalized);
@@ -1042,7 +1060,22 @@ async function startServer() {
     };
   }
 
-  app.all(['/dav', '/dav/*'], (req: Request, res: Response) => {
+  function resolveDestinationPath(destinationHeader: string): { fsPath: string; relPath: string } | null {
+    try {
+      let destUrl = destinationHeader.trim();
+      if (destUrl.startsWith('http://') || destUrl.startsWith('https://')) {
+        const u = new URL(destUrl);
+        destUrl = u.pathname;
+      }
+      const resolved = resolveWebdavPath(destUrl);
+      if (!resolved) return null;
+      return { fsPath: resolved.fsPath, relPath: resolved.relPath };
+    } catch {
+      return null;
+    }
+  }
+
+  const handleWebdavRequest = (req: Request, res: Response) => {
     const { handled } = applyWebdavHeadersAndAuth(req, res);
     if (handled) return;
 
@@ -1054,6 +1087,8 @@ async function startServer() {
 
     const { fsPath, relPath, isRoot } = resolved;
     const method = req.method.toUpperCase();
+    const isDavPrefixed = (req.originalUrl || req.url || '').startsWith('/dav');
+    const urlPrefix = isDavPrefixed ? '/dav' : '';
 
     // PROPFIND
     if (method === 'PROPFIND') {
@@ -1066,23 +1101,40 @@ async function startServer() {
       const responsesXml: string[] = [];
 
       const escapeXml = (str: string) =>
-        str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
       const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
-      const baseHref = isRoot ? '/dav/' : `/dav/${cleanRel}${isDir ? '/' : ''}`;
+      const baseHref = isRoot
+        ? (urlPrefix ? `${urlPrefix}/` : '/')
+        : `${urlPrefix ? `${urlPrefix}/` : '/'}${cleanRel}${isDir ? '/' : ''}`;
 
-      responsesXml.push(`  <D:response>
-    <D:href>${baseHref}</D:href>
+      const formatPropstat = (href: string, name: string, itemStat: fs.Stats, itemIsDir: boolean, itemFullPath: string) => {
+        const etag = `"${itemStat.size.toString(16)}-${itemStat.mtimeMs.toString(16)}"`;
+        const mimeType = itemIsDir ? 'httpd/unix-directory' : getMimeType(itemFullPath);
+        return `  <D:response>
+    <D:href>${href}</D:href>
     <D:propstat>
       <D:prop>
-        <D:displayname>${escapeXml(isRoot ? 'dav' : path.basename(fsPath))}</D:displayname>
-        <D:getlastmodified>${stat.mtime.toUTCString()}</D:getlastmodified>
-        <D:getcontentlength>${isDir ? 0 : stat.size}</D:getcontentlength>
-        <D:resourcetype>${isDir ? '<D:collection/>' : ''}</D:resourcetype>
+        <D:displayname>${escapeXml(name)}</D:displayname>
+        <D:getlastmodified>${itemStat.mtime.toUTCString()}</D:getlastmodified>
+        <D:creationdate>${itemStat.birthtime.toISOString()}</D:creationdate>
+        <D:getcontentlength>${itemIsDir ? 0 : itemStat.size}</D:getcontentlength>
+        <D:getcontenttype>${mimeType}</D:getcontenttype>
+        <D:getetag>${etag}</D:getetag>
+        <D:resourcetype>${itemIsDir ? '<D:collection/>' : ''}</D:resourcetype>
+        <D:supportedlock>
+          <D:lockentry>
+            <D:lockscope><D:exclusive/></D:lockscope>
+            <D:locktype><D:write/></D:locktype>
+          </D:lockentry>
+        </D:supportedlock>
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
-  </D:response>`);
+  </D:response>`;
+      };
+
+      responsesXml.push(formatPropstat(baseHref, isRoot ? 'webdav' : path.basename(fsPath), stat, isDir, fsPath));
 
       if (isDir && req.headers.depth !== '0') {
         try {
@@ -1093,18 +1145,7 @@ async function startServer() {
               const childStat = fs.statSync(childPath);
               const childIsDir = childStat.isDirectory();
               const childHref = `${baseHref}${encodeURIComponent(child)}${childIsDir ? '/' : ''}`;
-              responsesXml.push(`  <D:response>
-    <D:href>${childHref}</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:displayname>${escapeXml(child)}</D:displayname>
-        <D:getlastmodified>${childStat.mtime.toUTCString()}</D:getlastmodified>
-        <D:getcontentlength>${childIsDir ? 0 : childStat.size}</D:getcontentlength>
-        <D:resourcetype>${childIsDir ? '<D:collection/>' : ''}</D:resourcetype>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>`);
+              responsesXml.push(formatPropstat(childHref, child, childStat, childIsDir, childPath));
             } catch {}
           }
         } catch {}
@@ -1116,7 +1157,7 @@ async function startServer() {
       return;
     }
 
-    // GET / HEAD
+    // GET / HEAD (with HTTP Range request support)
     if (method === 'GET' || method === 'HEAD') {
       if (!fs.existsSync(fsPath)) {
         res.status(404).send('Not Found');
@@ -1125,12 +1166,12 @@ async function startServer() {
       const stat = fs.statSync(fsPath);
       if (stat.isDirectory()) {
         const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
-        const currentHref = isRoot ? '/dav/' : `/dav/${cleanRel}/`;
+        const currentHref = isRoot ? (urlPrefix ? `${urlPrefix}/` : '/') : `${urlPrefix ? `${urlPrefix}/` : '/'}${cleanRel}/`;
         let parentHref: string | null = null;
         if (!isRoot) {
           const parts = cleanRel.split('/');
           parts.pop();
-          parentHref = parts.length > 0 ? `/dav/${parts.join('/')}/` : '/dav/';
+          parentHref = parts.length > 0 ? `${urlPrefix ? `${urlPrefix}/` : '/'}${parts.join('/')}/` : (urlPrefix ? `${urlPrefix}/` : '/');
         }
 
         const items = fs
@@ -1152,10 +1193,38 @@ async function startServer() {
         return;
       }
 
-      // Binary-safe file serving
+      res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Content-Type', getMimeType(fsPath));
-      res.setHeader('Content-Length', String(stat.size));
+      const etag = `"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
+      res.setHeader('ETag', etag);
       res.setHeader('Last-Modified', stat.mtime.toUTCString());
+
+      const rangeHeader = req.headers.range;
+      if (rangeHeader && rangeHeader.startsWith('bytes=')) {
+        const parts = rangeHeader.replace('bytes=', '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+
+        if (isNaN(start) || isNaN(end) || start > end || start >= stat.size) {
+          res.setHeader('Content-Range', `bytes */${stat.size}`);
+          res.status(416).send('Requested Range Not Satisfiable');
+          return;
+        }
+
+        const chunksize = end - start + 1;
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Content-Length', String(chunksize));
+        res.status(206);
+        if (method === 'HEAD') {
+          res.end();
+        } else {
+          const stream = fs.createReadStream(fsPath, { start, end });
+          stream.pipe(res);
+        }
+        return;
+      }
+
+      res.setHeader('Content-Length', String(stat.size));
       if (method === 'HEAD') {
         res.status(200).end();
       } else {
@@ -1172,31 +1241,33 @@ async function startServer() {
         return;
       }
       fs.mkdirSync(path.dirname(fsPath), { recursive: true });
+      const fileAlreadyExists = fs.existsSync(fsPath);
 
       if (Buffer.isBuffer(req.body)) {
         fs.writeFileSync(fsPath, req.body);
-        res.status(201).send('Created');
       } else if (typeof req.body === 'string') {
         fs.writeFileSync(fsPath, req.body, 'utf8');
-        res.status(201).send('Created');
       } else if (req.body && typeof req.body === 'object' && !('pipe' in req.body)) {
         fs.writeFileSync(fsPath, JSON.stringify(req.body, null, 2), 'utf8');
-        res.status(201).send('Created');
       } else if (typeof (req as any).pipe === 'function' && !req.readableEnded) {
-        // Stream writing when body parser has not consumed req
         const out = fs.createWriteStream(fsPath);
         req.pipe(out);
         out.on('finish', () => {
-          res.status(201).send('Created');
+          const finalStat = fs.statSync(fsPath);
+          res.setHeader('ETag', `"${finalStat.size.toString(16)}-${finalStat.mtimeMs.toString(16)}"`);
+          res.status(fileAlreadyExists ? 204 : 201).end();
         });
         out.on('error', (err) => {
           res.status(500).send('Write error: ' + err.message);
         });
+        return;
       } else {
-        // Fallback: create empty file if body was empty
         fs.writeFileSync(fsPath, Buffer.alloc(0));
-        res.status(201).send('Created');
       }
+
+      const finalStat = fs.statSync(fsPath);
+      res.setHeader('ETag', `"${finalStat.size.toString(16)}-${finalStat.mtimeMs.toString(16)}"`);
+      res.status(fileAlreadyExists ? 204 : 201).end();
       return;
     }
 
@@ -1226,8 +1297,129 @@ async function startServer() {
       return;
     }
 
+    // MOVE
+    if (method === 'MOVE') {
+      if (isRoot) {
+        res.status(403).send('Cannot move root collection');
+        return;
+      }
+      if (!fs.existsSync(fsPath)) {
+        res.status(404).send('Source Not Found');
+        return;
+      }
+      const destHeader = req.headers.destination as string;
+      if (!destHeader) {
+        res.status(400).send('Destination header required');
+        return;
+      }
+      const dest = resolveDestinationPath(destHeader);
+      if (!dest) {
+        res.status(403).send('Invalid destination');
+        return;
+      }
+      const overwrite = req.headers.overwrite !== 'F';
+      const destExists = fs.existsSync(dest.fsPath);
+      if (destExists && !overwrite) {
+        res.status(412).send('Precondition Failed: Destination exists');
+        return;
+      }
+
+      fs.mkdirSync(path.dirname(dest.fsPath), { recursive: true });
+      if (destExists) {
+        fs.rmSync(dest.fsPath, { recursive: true, force: true });
+      }
+
+      try {
+        fs.renameSync(fsPath, dest.fsPath);
+      } catch (e: any) {
+        if (e.code === 'EXDEV') {
+          fs.cpSync(fsPath, dest.fsPath, { recursive: true });
+          fs.rmSync(fsPath, { recursive: true, force: true });
+        } else {
+          res.status(500).send('Move failed: ' + e.message);
+          return;
+        }
+      }
+
+      res.status(destExists ? 204 : 201).end();
+      return;
+    }
+
+    // COPY
+    if (method === 'COPY') {
+      if (!fs.existsSync(fsPath)) {
+        res.status(404).send('Source Not Found');
+        return;
+      }
+      const destHeader = req.headers.destination as string;
+      if (!destHeader) {
+        res.status(400).send('Destination header required');
+        return;
+      }
+      const dest = resolveDestinationPath(destHeader);
+      if (!dest) {
+        res.status(403).send('Invalid destination');
+        return;
+      }
+      const overwrite = req.headers.overwrite !== 'F';
+      const destExists = fs.existsSync(dest.fsPath);
+      if (destExists && !overwrite) {
+        res.status(412).send('Precondition Failed: Destination exists');
+        return;
+      }
+
+      fs.mkdirSync(path.dirname(dest.fsPath), { recursive: true });
+      if (destExists) {
+        fs.rmSync(dest.fsPath, { recursive: true, force: true });
+      }
+
+      fs.cpSync(fsPath, dest.fsPath, { recursive: true });
+      res.status(destExists ? 204 : 201).end();
+      return;
+    }
+
+    // LOCK
+    if (method === 'LOCK') {
+      const lockToken = `urn:uuid:${crypto.randomUUID()}`;
+      res.setHeader('Lock-Token', `<${lockToken}>`);
+      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+
+      const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+      const baseHref = isRoot
+        ? (urlPrefix ? `${urlPrefix}/` : '/')
+        : `${urlPrefix ? `${urlPrefix}/` : '/'}${cleanRel}${fs.existsSync(fsPath) && fs.statSync(fsPath).isDirectory() ? '/' : ''}`;
+
+      const lockXml = `<?xml version="1.0" encoding="utf-8"?>\n<D:prop xmlns:D="DAV:">\n  <D:lockdiscovery>\n    <D:activelock>\n      <D:locktype><D:write/></D:locktype>\n      <D:lockscope><D:exclusive/></D:lockscope>\n      <D:depth>Infinity</D:depth>\n      <D:owner><D:href>${baseHref}</D:href></D:owner>\n      <D:timeout>Second-3600</D:timeout>\n      <D:locktoken><D:href>${lockToken}</D:href></D:locktoken>\n      <D:lockroot><D:href>${baseHref}</D:href></D:lockroot>\n    </D:activelock>\n  </D:lockdiscovery>\n</D:prop>`;
+
+      const status = fs.existsSync(fsPath) ? 200 : 201;
+      if (!fs.existsSync(fsPath)) {
+        fs.mkdirSync(path.dirname(fsPath), { recursive: true });
+        fs.writeFileSync(fsPath, Buffer.alloc(0));
+      }
+      res.status(status).send(lockXml);
+      return;
+    }
+
+    // UNLOCK
+    if (method === 'UNLOCK') {
+      res.status(204).end();
+      return;
+    }
+
+    // PROPPATCH
+    if (method === 'PROPPATCH') {
+      const cleanRel = relPath ? relPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+      const baseHref = isRoot ? (urlPrefix ? `${urlPrefix}/` : '/') : `${urlPrefix ? `${urlPrefix}/` : '/'}${cleanRel}`;
+      const patchXml = `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n  <D:response>\n    <D:href>${baseHref}</D:href>\n    <D:propstat>\n      <D:prop/>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n</D:multistatus>`;
+      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+      res.status(207).send(patchXml);
+      return;
+    }
+
     res.status(405).send('Method Not Allowed');
-  });
+  };
+
+  app.all(['/dav', '/dav/*'], handleWebdavRequest);
 
   // ============================================================================
   // 5. Authenticated App API Routes (/api/*)
@@ -1254,7 +1446,7 @@ async function startServer() {
     }
 
     const folders = readHostVolumesItems();
-    const { headers, webdavHost, webdavPort } = parseStackEnv();
+    const { headers, webdavHost, webAppPort, webdavPort } = parseStackEnv();
     const artifacts = generateStackArtifacts();
     const detectedIp = getDetectedLocalIp();
     const detectedHost = String(req.headers.host || `${detectedIp}:3000`);
@@ -1271,6 +1463,8 @@ async function startServer() {
       webdavHostConfig: {
         domainOrIp: webdavHost,
         port: webdavPort,
+        webAppPort,
+        webdavPort,
         detectedIp,
         detectedHost,
       },
@@ -1390,10 +1584,11 @@ async function startServer() {
 
   app.put('/api/webdav-host', async (req: Request, res: Response) => {
     const domainOrIp = String(req.body?.domainOrIp || '').trim() || getDetectedLocalIp();
-    const port = String(req.body?.port || '8080').trim() || '8080';
+    const webAppPort = String(req.body?.webAppPort || '8080').trim() || '8080';
+    const webdavPort = String(req.body?.webdavPort || req.body?.port || '8081').trim() || '8081';
     const { headers } = parseStackEnv();
-    writeStackEnv(headers, domainOrIp, port);
-    res.json({ ok: true, domainOrIp, port });
+    writeStackEnv(headers, domainOrIp, webAppPort, webdavPort);
+    res.json({ ok: true, domainOrIp, webAppPort, webdavPort });
   });
 
   // Host folder operations inside ./host_volumes
@@ -1486,9 +1681,19 @@ async function startServer() {
     });
   }
 
+  // 1. Dedicated RFC 4918 WebDAV Server listening on port 3001 (mapped to WEBDAV_PORT on host)
+  const WEBDAV_INTERNAL_PORT = 3001;
+  const davServerApp = express();
+  davServerApp.use(express.raw({ type: '*/*', limit: '500mb' }));
+  davServerApp.all('*', handleWebdavRequest);
+  davServerApp.listen(WEBDAV_INTERNAL_PORT, '0.0.0.0', () => {
+    console.log(`Dedicated WebDAV Server listening on http://0.0.0.0:${WEBDAV_INTERNAL_PORT}`);
+  });
+
+  // 2. Main VaultDAV Web App & Admin Dashboard on port 3000 (mapped to WEB_APP_PORT on host)
   const PORT = 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`VaultDAV Server + Native Syncthing Proxy listening on http://0.0.0.0:${PORT}`);
+    console.log(`VaultDAV Web App listening on http://0.0.0.0:${PORT}`);
     // Pre-generate static zip archive for instant docker-compose download
     createDockerComposeZipBuffer().catch((err) => {
       console.warn('Initial docker-compose.zip generation error:', err);

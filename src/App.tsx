@@ -108,7 +108,8 @@ export default function App() {
   const [showSafePassword, setShowSafePassword] = useState<boolean>(true);
   const [regeneratingCreds, setRegeneratingCreds] = useState<boolean>(false);
   const [hostInput, setHostInput] = useState<string>('');
-  const [portInput, setPortInput] = useState<string>('8080');
+  const [webAppPortInput, setWebAppPortInput] = useState<string>('8080');
+  const [portInput, setPortInput] = useState<string>('8081');
   const [savingHost, setSavingHost] = useState<boolean>(false);
   const [downloadingZip, setDownloadingZip] = useState<boolean>(false);
 
@@ -209,7 +210,8 @@ export default function App() {
           setDavLoginUser(data.account.username);
           setDavLoginPass((prev) => prev || data.webdavCredentials.password);
           setHostInput((prev) => prev || data.webdavHostConfig.domainOrIp);
-          setPortInput((prev) => prev || data.webdavHostConfig.port);
+          setWebAppPortInput((prev) => prev || data.webdavHostConfig.webAppPort || '8080');
+          setPortInput((prev) => prev || data.webdavHostConfig.webdavPort || data.webdavHostConfig.port || '8081');
           const firstExposed = data.folders.find((f) => f.exposed);
           if (firstExposed) {
             setDavMountSlug((prev) =>
@@ -417,7 +419,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           domainOrIp: hostInput.trim(),
-          port: portInput.trim() || '8080',
+          webAppPort: webAppPortInput.trim() || '8080',
+          webdavPort: portInput.trim() || '8081',
         }),
       });
       if (res.ok) {
@@ -909,10 +912,11 @@ export default function App() {
   const activeMountPath = '/dav/';
   const domainDavUrl = `${browserOrigin}${activeMountPath}`;
   const configuredHost = state.webdavHostConfig.domainOrIp || state.webdavHostConfig.detectedIp;
-  const configuredPort = state.webdavHostConfig.port || '8080';
+  const configuredWebAppPort = state.webdavHostConfig.webAppPort || '8080';
+  const configuredWebdavPort = state.webdavHostConfig.webdavPort || state.webdavHostConfig.port || '8081';
   const ipOrCustomDomainDavUrl = configuredHost.startsWith('http')
-    ? `${configuredHost.replace(/\/+$/, '')}${activeMountPath}`
-    : `http://${configuredHost}:${configuredPort}${activeMountPath}`;
+    ? `${configuredHost.replace(/\/+$/, '')}/`
+    : `http://${configuredHost}:${configuredWebdavPort}/`;
 
   const is2faActive = Boolean(state.account.totp_enabled);
 
@@ -1398,41 +1402,59 @@ export default function App() {
                   </button>
                 </div>
 
-                <form onSubmit={handleSaveWebdavHost} className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    placeholder="Domain or IP (e.g. 192.168.1.50 or dav.example.com)"
-                    value={hostInput}
-                    onChange={(e) => setHostInput(e.target.value)}
-                    className="flex-1 px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Port"
-                    value={portInput}
-                    onChange={(e) => setPortInput(e.target.value)}
-                    className="w-20 px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <button
-                    type="submit"
-                    disabled={savingHost}
-                    className="px-3 py-1.5 text-xs font-semibold bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md shrink-0"
-                  >
-                    {savingHost ? 'Saving...' : 'Save Host'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy('dav-ip-url', ipOrCustomDomainDavUrl)}
-                    className="px-2.5 py-1.5 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-blue-400 border border-zinc-800 rounded-md shrink-0 inline-flex items-center gap-1"
-                    title={ipOrCustomDomainDavUrl}
-                  >
-                    {copiedId === 'dav-ip-url' ? (
-                      <Check className="w-3.5 h-3.5 text-blue-400" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" />
-                    )}
-                    Copy IP/Host URL
-                  </button>
+                <form onSubmit={handleSaveWebdavHost} className="flex flex-wrap items-center gap-2">
+                  <div className="flex-1 min-w-[200px]">
+                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">HOST / IP</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. 192.168.1.50 or dav.example.com"
+                      value={hostInput}
+                      onChange={(e) => setHostInput(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                  <div className="w-24">
+                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">WEBDAV PORT</label>
+                    <input
+                      type="text"
+                      placeholder="8081"
+                      value={portInput}
+                      onChange={(e) => setPortInput(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                  <div className="w-24">
+                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">WEB APP PORT</label>
+                    <input
+                      type="text"
+                      placeholder="8080"
+                      value={webAppPortInput}
+                      onChange={(e) => setWebAppPortInput(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                  <div className="flex items-end gap-2 pt-4">
+                    <button
+                      type="submit"
+                      disabled={savingHost}
+                      className="px-3 py-1.5 text-xs font-semibold bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md shrink-0"
+                    >
+                      {savingHost ? 'Saving...' : 'Save Ports & Host'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy('dav-ip-url', ipOrCustomDomainDavUrl)}
+                      className="px-2.5 py-1.5 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-blue-400 border border-zinc-800 rounded-md shrink-0 inline-flex items-center gap-1"
+                      title={ipOrCustomDomainDavUrl}
+                    >
+                      {copiedId === 'dav-ip-url' ? (
+                        <Check className="w-3.5 h-3.5 text-blue-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      Copy WebDAV URL
+                    </button>
+                  </div>
                 </form>
               </div>
             </div>
@@ -1450,7 +1472,7 @@ export default function App() {
                   Host Volumes Folder (./host_volumes)
                 </h2>
                 <p className="text-xs text-zinc-400 mt-0.5">
-                  Only <code className="font-mono text-blue-400">./host_volumes</code> is exposed in <code className="font-mono">.env</code> &amp; <code className="font-mono">docker-compose.yml</code>. All subfolders are configured inside <code className="font-mono">./host_volumes/folders.json</code>.
+                  Only <code className="font-mono text-blue-400">./host_volumes</code> is exposed in <code className="font-mono">.env</code> &amp; <code className="font-mono">docker-compose.yml</code>. All subfolders and files live inside <code className="font-mono text-zinc-300">./host_volumes</code>.
                 </p>
               </div>
               <div className="px-3 py-1.5 bg-[#050507] border border-zinc-800 rounded text-xs font-mono text-zinc-300 shrink-0">
@@ -1473,7 +1495,7 @@ export default function App() {
                       </code>
                     </div>
                     <div className="text-xs text-zinc-500 font-mono tabular-nums mt-0.5">
-                      {folder.env_expose_key}={folder.exposed ? 'true' : 'false'} ·{' '}
+                      ./host_volumes/{folder.slug} ·{' '}
                       {folder.fileCount} file(s) ({formatBytes(folder.totalBytes)})
                     </div>
                   </div>
