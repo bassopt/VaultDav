@@ -16,6 +16,15 @@ import {
   Save,
   Sliders,
   ExternalLink,
+  KeyRound,
+  Eye,
+  EyeOff,
+  Globe,
+  Archive,
+  ShieldCheck,
+  ShieldAlert,
+  Shield,
+  X,
 } from 'lucide-react';
 import type {
   AppStateResponse,
@@ -86,6 +95,7 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authUsername, setAuthUsername] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [authTotpCode, setAuthTotpCode] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
 
@@ -93,6 +103,25 @@ export default function App() {
   const [state, setState] = useState<AppStateResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Main App Auto-Generated WebDAV Credentials & Domain/IP state
+  const [showSafePassword, setShowSafePassword] = useState<boolean>(true);
+  const [regeneratingCreds, setRegeneratingCreds] = useState<boolean>(false);
+  const [hostInput, setHostInput] = useState<string>('');
+  const [portInput, setPortInput] = useState<string>('8080');
+  const [savingHost, setSavingHost] = useState<boolean>(false);
+  const [downloadingZip, setDownloadingZip] = useState<boolean>(false);
+
+  // Account Menu & Optional TOTP 2FA Modal / Panel
+  const [showAccountModal, setShowAccountModal] = useState<boolean>(false);
+  const [setup2faSecret, setSetup2faSecret] = useState<string>('');
+  const [setup2faQrSvg, setSetup2faQrSvg] = useState<string>('');
+  const [setup2faVerifyCode, setSetup2faVerifyCode] = useState<string>('');
+  const [setup2faLoading, setSetup2faLoading] = useState<boolean>(false);
+  const [setup2faError, setSetup2faError] = useState<string | null>(null);
+  const [setup2faSuccess, setSetup2faSuccess] = useState<string | null>(null);
+  const [disable2faPassword, setDisable2faPassword] = useState<string>('');
+  const [showDisable2faForm, setShowDisable2faForm] = useState<boolean>(false);
 
   // 1. Small Host Folder Picker state (when adding a new folder to .env)
   const [showHostBrowser, setShowHostBrowser] = useState<boolean>(false);
@@ -102,7 +131,7 @@ export default function App() {
   const [newSlug, setNewSlug] = useState('');
   const [newHostPath, setNewHostPath] = useState('');
 
-  // 2. Real WebDAV File Manager App state
+  // 2. Real WebDAV File Manager App state (Requires WebDAV User & Safe Password)
   const [davAuthed, setDavAuthed] = useState<boolean>(false);
   const [davLoginUser, setDavLoginUser] = useState<string>('');
   const [davLoginPass, setDavLoginPass] = useState<string>('');
@@ -121,7 +150,7 @@ export default function App() {
   const [newDavFileName, setNewDavFileName] = useState<string>('');
 
   // Simple Custom HTTP Headers inside WebDAV App
-  const [showDavHeadersPanel, setShowDavHeadersPanel] = useState<boolean>(true);
+  const [showDavHeadersPanel, setShowDavHeadersPanel] = useState<boolean>(false);
   const [headerName, setHeaderName] = useState('');
   const [headerValue, setHeaderValue] = useState('');
   const [clientHeaderName, setClientHeaderName] = useState('');
@@ -176,7 +205,11 @@ export default function App() {
         if (stateRes.ok) {
           const data: AppStateResponse = await stateRes.json();
           setState(data);
-          setDavLoginUser((prev) => prev || data.account.username);
+          // WebDAV username is strictly the same as login username
+          setDavLoginUser(data.account.username);
+          setDavLoginPass((prev) => prev || data.webdavCredentials.password);
+          setHostInput((prev) => prev || data.webdavHostConfig.domainOrIp);
+          setPortInput((prev) => prev || data.webdavHostConfig.port);
           const firstExposed = data.folders.find((f) => f.exposed);
           if (firstExposed) {
             setDavMountSlug((prev) =>
@@ -200,7 +233,7 @@ export default function App() {
     checkAuthAndLoad();
   }, [checkAuthAndLoad]);
 
-  // Perform real WebDAV request with Basic Auth + optional custom client header
+  // Perform real WebDAV request with Basic Auth (WebDAV User + Safe Password) + optional custom client header
   const fetchWebdav = useCallback(
     async (
       pathUrl: string,
@@ -238,7 +271,12 @@ export default function App() {
   );
 
   const loadWebdavDirectory = useCallback(
-    async (slug = davMountSlug, sub = davSubPath, user?: string, pass?: string) => {
+    async (
+      slug = davMountSlug,
+      sub = davSubPath,
+      user?: string,
+      pass?: string
+    ) => {
       if (!slug) return false;
       setDavLoading(true);
       setDavAuthError(null);
@@ -254,8 +292,9 @@ export default function App() {
         const res = await fetchWebdav(href, 'PROPFIND', undefined, user, pass);
 
         if (res.status === 401) {
+          const errText = await res.text();
           setDavAuthed(false);
-          setDavAuthError('Invalid WebDAV login or password');
+          setDavAuthError(errText || 'Invalid WebDAV username or password');
           return false;
         }
         if (!res.ok && res.status !== 207) {
@@ -285,21 +324,34 @@ export default function App() {
     }
   }, [activeTab, davAuthed, davMountSlug, davSubPath, loadWebdavDirectory]);
 
+  // Auth Submission: Register requires ONLY Username and Password.
+  // Sign In requires TOTP only if 2FA has been enabled on the account.
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!authUsername.trim() || !authPassword) return;
+    if (authStatus?.hasAccount && authStatus.totpEnabled && !authTotpCode.trim()) {
+      setAuthError('Please enter your 6-digit TOTP code');
+      return;
+    }
+
     setAuthSubmitting(true);
     setAuthError(null);
 
-    const endpoint = authStatus?.hasAccount ? '/api/auth/login' : '/api/auth/setup';
+    const isSetup = !authStatus?.hasAccount;
+    const endpoint = isSetup ? '/api/auth/setup' : '/api/auth/login';
     try {
+      const payload: any = {
+        username: authUsername.trim(),
+        password: authPassword,
+      };
+      if (!isSetup && authStatus?.totpEnabled) {
+        payload.totpCode = authTotpCode.trim();
+      }
+
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: authUsername.trim(),
-          password: authPassword,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -307,10 +359,8 @@ export default function App() {
       } else {
         localStorage.setItem('vaultdav_token', data.token);
         setSessionToken(data.token);
-        setDavLoginUser(authUsername.trim());
-        setDavLoginPass(authPassword);
-        setDavAuthed(true);
         setAuthPassword('');
+        setAuthTotpCode('');
       }
     } catch (err: any) {
       setAuthError(err.message || 'Network error');
@@ -326,6 +376,7 @@ export default function App() {
     setState(null);
     setDavAuthed(false);
     setDavLoginPass('');
+    setShowAccountModal(false);
     setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, username: null } : null));
   };
 
@@ -333,6 +384,150 @@ export default function App() {
     navigator.clipboard.writeText(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 1600);
+  };
+
+  // Auto-generate safe WebDAV password on the main app
+  const handleRegenerateWebdavCredentials = async () => {
+    setRegeneratingCreds(true);
+    try {
+      const res = await apiFetch('/api/webdav-credentials/regenerate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDavLoginUser(data.webdavCredentials.username);
+        setDavLoginPass(data.webdavCredentials.password);
+        await checkAuthAndLoad();
+      }
+    } finally {
+      setRegeneratingCreds(false);
+    }
+  };
+
+  const handleSaveWebdavHost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingHost(true);
+    try {
+      const res = await apiFetch('/api/webdav-host', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          domainOrIp: hostInput.trim(),
+          port: portInput.trim() || '8080',
+        }),
+      });
+      if (res.ok) {
+        await checkAuthAndLoad();
+      }
+    } finally {
+      setSavingHost(false);
+    }
+  };
+
+  // Download ready-to-run Docker Compose ZIP file
+  const handleDownloadDockerZip = async () => {
+    setDownloadingZip(true);
+    try {
+      const res = await apiFetch('/api/docker/download-zip');
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'vaultdav-docker-compose.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } finally {
+      setDownloadingZip(false);
+    }
+  };
+
+  // =========================================================================
+  // ACCOUNT & SECURITY (TOTP 2FA MANAGEMENT)
+  // =========================================================================
+  const handleStartSetup2FA = async () => {
+    setSetup2faLoading(true);
+    setSetup2faError(null);
+    setSetup2faSuccess(null);
+    setSetup2faVerifyCode('');
+    try {
+      const res = await apiFetch('/api/account/2fa/prepare', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setSetup2faSecret(data.secret);
+        setSetup2faQrSvg(data.qrSvg);
+      } else {
+        setSetup2faError('Failed to prepare TOTP setup');
+      }
+    } catch (err: any) {
+      setSetup2faError(err.message || 'Network error');
+    } finally {
+      setSetup2faLoading(false);
+    }
+  };
+
+  const handleActivate2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!setup2faVerifyCode.trim() || !setup2faSecret) return;
+    setSetup2faLoading(true);
+    setSetup2faError(null);
+    setSetup2faSuccess(null);
+    try {
+      const res = await apiFetch('/api/account/2fa/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          secret: setup2faSecret,
+          code: setup2faVerifyCode.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSetup2faError(data.error || 'Failed to activate 2FA');
+      } else {
+        setSetup2faSuccess('Two-Factor Authentication is now active on your account!');
+        setSetup2faSecret('');
+        setSetup2faQrSvg('');
+        setSetup2faVerifyCode('');
+        await checkAuthAndLoad();
+      }
+    } catch (err: any) {
+      setSetup2faError(err.message || 'Network error');
+    } finally {
+      setSetup2faLoading(false);
+    }
+  };
+
+  const handleDisable2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!disable2faPassword) return;
+    setSetup2faLoading(true);
+    setSetup2faError(null);
+    setSetup2faSuccess(null);
+    try {
+      const res = await apiFetch('/api/account/2fa/disable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: disable2faPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSetup2faError(data.error || 'Failed to disable 2FA');
+      } else {
+        setSetup2faSuccess('Two-Factor Authentication has been disabled.');
+        setShowDisable2faForm(false);
+        setDisable2faPassword('');
+        await checkAuthAndLoad();
+      }
+    } catch (err: any) {
+      setSetup2faError(err.message || 'Network error');
+    } finally {
+      setSetup2faLoading(false);
+    }
   };
 
   // =========================================================================
@@ -547,24 +742,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleDownloadStack = () => {
-    if (!state) return;
-    const bundle = [
-      '# --- FILE: docker-compose.yml ---',
-      state.artifacts.composeContent,
-      '',
-      '# --- FILE: .env ---',
-      state.artifacts.envContent,
-      '',
-      '# --- FILE: Dockerfile ---',
-      state.artifacts.dockerfileContent,
-      '',
-      '# --- FILE: data/syncthing-config/config.xml ---',
-      state.artifacts.syncthingXmlContent,
-    ].join('\n');
-    handleDownloadSingleFile('vaultdav-docker-compose-bundle.txt', bundle);
-  };
-
   if (loading) {
     return (
       <div className="min-h-screen bg-[#050507] text-zinc-100 flex items-center justify-center">
@@ -574,16 +751,24 @@ export default function App() {
   }
 
   // =========================================================================
-  // LOGIN OR INITIAL SINGLE-ACCOUNT CREATION PROMPT
+  // LOGIN OR INITIAL ACCOUNT CREATION SCREEN
+  // Registration requires ONLY Username & Password (TOTP 2FA can be added later)
   // =========================================================================
   if (!authStatus?.authenticated || !state) {
     const isSetupMode = !authStatus?.hasAccount;
     return (
       <div className="min-h-screen bg-[#050507] text-zinc-100 flex items-center justify-center p-6">
         <div className="max-w-sm w-full bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-5">
-          <h1 className="text-xl font-bold tracking-tight text-zinc-100">
-            {isSetupMode ? 'Create Account' : 'Sign In'}
-          </h1>
+          <div>
+            <h1 className="text-xl font-bold tracking-tight text-zinc-100">
+              {isSetupMode ? 'Create Single Account' : 'Sign In'}
+            </h1>
+            <p className="text-xs text-zinc-400 mt-1">
+              {isSetupMode
+                ? 'Choose a username and password to initialize VaultDAV. (2FA can be added later in account menu)'
+                : 'Enter your credentials to access the VaultDAV dashboard.'}
+            </p>
+          </div>
 
           {authError && (
             <div className="p-3 bg-red-950/60 border border-red-800 rounded-md text-xs text-red-300">
@@ -603,6 +788,11 @@ export default function App() {
                 onChange={(e) => setAuthUsername(e.target.value)}
                 className="w-full px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
               />
+              {isSetupMode && (
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  This username will also be used for your WebDAV mount access.
+                </p>
+              )}
             </div>
 
             <div>
@@ -617,13 +807,36 @@ export default function App() {
               />
             </div>
 
+            {/* TOTP 2FA input is ONLY displayed during Sign In if 2FA was enabled on the account */}
+            {!isSetupMode && authStatus?.totpEnabled && (
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-medium text-zinc-300">
+                    TOTP 2FA Code (6 digits)
+                  </label>
+                  <span className="text-[10px] text-blue-400 font-mono">2FA Active</span>
+                </div>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  required
+                  placeholder="000000"
+                  value={authTotpCode}
+                  onChange={(e) => setAuthTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  className="w-full px-3 py-2 text-xs font-mono tracking-widest bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500 tabular-nums"
+                />
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={authSubmitting}
               className="w-full py-2.5 px-4 text-xs font-semibold bg-blue-600 text-white rounded-md hover:bg-blue-500 transition-colors"
             >
               {authSubmitting
-                ? 'Verifying...'
+                ? 'Processing...'
                 : isSetupMode
                 ? 'Create Account'
                 : 'Sign In'}
@@ -649,6 +862,17 @@ export default function App() {
 
   const activeDockerFile = getDockerFileDetails(selectedDockerFile);
   const exposedFolders = state.folders.filter((f) => f.exposed);
+
+  const browserOrigin = typeof window !== 'undefined' ? window.location.origin : `http://${state.webdavHostConfig.detectedHost}`;
+  const activeMountPath = `/dav/${davMountSlug.toLowerCase()}/`;
+  const domainDavUrl = `${browserOrigin}${activeMountPath}`;
+  const configuredHost = state.webdavHostConfig.domainOrIp || state.webdavHostConfig.detectedIp;
+  const configuredPort = state.webdavHostConfig.port || '8080';
+  const ipOrCustomDomainDavUrl = configuredHost.startsWith('http')
+    ? `${configuredHost.replace(/\/+$/, '')}${activeMountPath}`
+    : `http://${configuredHost}:${configuredPort}${activeMountPath}`;
+
+  const is2faActive = Boolean(state.account.totp_enabled);
 
   return (
     <div className="min-h-screen bg-[#050507] text-zinc-100 flex flex-col">
@@ -710,24 +934,61 @@ export default function App() {
 
         <div className="flex items-center shrink-0">
           <button
-            onClick={handleDownloadStack}
-            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors whitespace-nowrap shrink-0"
+            onClick={handleDownloadDockerZip}
+            disabled={downloadingZip}
+            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors whitespace-nowrap shrink-0 shadow-sm"
           >
-            <Download className="w-3.5 h-3.5" />
-            Download Docker Bundle
+            <Archive className="w-3.5 h-3.5" />
+            {downloadingZip ? 'Creating ZIP...' : 'Download Docker Compose (.zip)'}
           </button>
         </div>
       </header>
 
       <main className="max-w-[1140px] w-full mx-auto px-8 py-6 space-y-6 flex-1">
-        {/* Quick App Access Bar */}
+        {/* Quick App Access & Account Bar */}
         <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg px-5 py-3 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-2 text-xs font-mono text-zinc-300">
+          <div className="flex items-center gap-3 text-xs font-mono text-zinc-300">
             <span>Signed in as:</span>
             <strong className="text-zinc-100">{state.account.username}</strong>
+            <button
+              onClick={() => {
+                setShowAccountModal(true);
+                setSetup2faError(null);
+                setSetup2faSuccess(null);
+              }}
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-sans font-medium border transition-colors ${
+                is2faActive
+                  ? 'bg-blue-950/40 text-blue-300 border-blue-800 hover:bg-blue-900/40'
+                  : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:text-zinc-200'
+              }`}
+            >
+              {is2faActive ? (
+                <>
+                  <ShieldCheck className="w-3.5 h-3.5 text-blue-400" />
+                  <span>2FA Active</span>
+                </>
+              ) : (
+                <>
+                  <ShieldAlert className="w-3.5 h-3.5 text-zinc-500" />
+                  <span>Add 2FA</span>
+                </>
+              )}
+            </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              onClick={() => {
+                setShowAccountModal(true);
+                setSetup2faError(null);
+                setSetup2faSuccess(null);
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-zinc-800 rounded-md whitespace-nowrap"
+            >
+              <Shield className="w-3.5 h-3.5 text-blue-400" />
+              Account &amp; 2FA Menu
+            </button>
+
             <button
               onClick={() => setActiveTab('webdav_app')}
               className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
@@ -759,6 +1020,380 @@ export default function App() {
               <LogOut className="w-3.5 h-3.5" />
               Sign Out
             </button>
+          </div>
+        </section>
+
+        {/* Modal: Account & Optional TOTP 2FA Management */}
+        {showAccountModal && (
+          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-[#0c0d10] border border-zinc-800 rounded-lg max-w-md w-full p-6 space-y-5">
+              <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
+                <div className="flex items-center gap-2">
+                  <Shield className="w-4 h-4 text-blue-400" />
+                  <h3 className="text-sm font-semibold text-zinc-100">
+                    Account Security &amp; TOTP 2FA
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowAccountModal(false)}
+                  className="text-zinc-500 hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {setup2faError && (
+                <div className="p-3 bg-red-950/60 border border-red-800 rounded text-xs text-red-300">
+                  {setup2faError}
+                </div>
+              )}
+
+              {setup2faSuccess && (
+                <div className="p-3 bg-blue-950/60 border border-blue-800 rounded text-xs text-blue-300">
+                  {setup2faSuccess}
+                </div>
+              )}
+
+              {/* Account Info */}
+              <div className="space-y-2 p-3 bg-[#050507] border border-zinc-800 rounded-md text-xs font-mono">
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">Account Username:</span>
+                  <span className="text-zinc-100 font-bold">{state.account.username}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">2FA Status:</span>
+                  <span className={is2faActive ? 'text-blue-400 font-bold' : 'text-zinc-400'}>
+                    {is2faActive ? 'Enabled (Active)' : 'Disabled (Optional)'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">Credential Store:</span>
+                  <span className="text-zinc-300">SQLite (AES-256-GCM)</span>
+                </div>
+              </div>
+
+              {/* If 2FA is currently NOT active: option to setup */}
+              {!is2faActive && !setup2faSecret && (
+                <div className="space-y-3">
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Protect your account with Two-Factor Authentication (TOTP RFC 6238). When enabled, signing in will require a 6-digit code from Google Authenticator, 1Password, or Authy.
+                  </p>
+                  <button
+                    type="button"
+                    disabled={setup2faLoading}
+                    onClick={handleStartSetup2FA}
+                    className="w-full py-2 px-4 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-md transition-colors"
+                  >
+                    {setup2faLoading ? 'Generating Secret...' : 'Set Up TOTP 2FA Now'}
+                  </button>
+                </div>
+              )}
+
+              {/* Active 2FA Setup Flow with QR Code & Base32 secret */}
+              {!is2faActive && setup2faSecret && (
+                <form onSubmit={handleActivate2FA} className="space-y-4">
+                  <div className="p-3 bg-[#050507] border border-zinc-800 rounded-md space-y-3">
+                    <div className="text-xs font-medium text-zinc-300 text-center">
+                      1. Scan with Authenticator App
+                    </div>
+                    {setup2faQrSvg && (
+                      <div
+                        className="w-36 h-36 mx-auto p-2 bg-[#050507] border border-zinc-800 rounded flex items-center justify-center [&>svg]:w-full [&>svg]:h-full"
+                        dangerouslySetInnerHTML={{ __html: setup2faQrSvg }}
+                      />
+                    )}
+                    <div className="space-y-1">
+                      <div className="text-[11px] text-zinc-500">TOTP Secret Key (Base32)</div>
+                      <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 bg-[#0c0d10] border border-zinc-800 rounded text-xs font-mono text-blue-400">
+                        <span className="truncate">{setup2faSecret}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy('account-totp-secret', setup2faSecret)}
+                          className="text-zinc-400 hover:text-white shrink-0"
+                          title="Copy TOTP Secret"
+                        >
+                          {copiedId === 'account-totp-secret' ? (
+                            <Check className="w-3.5 h-3.5 text-blue-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">
+                      2. Enter 6-digit verification code
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      required
+                      autoFocus
+                      placeholder="000000"
+                      value={setup2faVerifyCode}
+                      onChange={(e) =>
+                        setSetup2faVerifyCode(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      className="w-full px-3 py-2 text-xs font-mono tracking-widest bg-[#050507] border border-zinc-800 rounded text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500 tabular-nums"
+                    />
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSetup2faSecret('');
+                        setSetup2faQrSvg('');
+                      }}
+                      className="w-1/3 py-2 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-zinc-800 rounded"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={setup2faLoading || setup2faVerifyCode.length !== 6}
+                      className="flex-1 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50"
+                    >
+                      {setup2faLoading ? 'Verifying...' : 'Verify & Enable 2FA'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* If 2FA is currently ACTIVE: option to disable or reconfigure */}
+              {is2faActive && (
+                <div className="space-y-3">
+                  {!showDisable2faForm ? (
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={handleStartSetup2FA}
+                        className="flex-1 py-2 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded"
+                      >
+                        Reconfigure 2FA
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowDisable2faForm(true)}
+                        className="py-2 px-3 text-xs font-medium bg-red-950/40 hover:bg-red-900/40 text-red-300 border border-red-800/80 rounded"
+                      >
+                        Disable 2FA
+                      </button>
+                    </div>
+                  ) : (
+                    <form onSubmit={handleDisable2FA} className="space-y-3 p-3 bg-[#050507] border border-zinc-800 rounded-md">
+                      <div className="text-xs font-medium text-zinc-300">
+                        Confirm Account Password to Disable 2FA
+                      </div>
+                      <input
+                        type="password"
+                        required
+                        autoFocus
+                        placeholder="Account Password"
+                        value={disable2faPassword}
+                        onChange={(e) => setDisable2faPassword(e.target.value)}
+                        className="w-full px-3 py-2 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-red-500"
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowDisable2faForm(false);
+                            setDisable2faPassword('');
+                          }}
+                          className="w-1/2 py-1.5 text-xs font-medium bg-zinc-900 text-zinc-300 rounded border border-zinc-800"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={setup2faLoading || !disable2faPassword}
+                          className="w-1/2 py-1.5 text-xs font-semibold bg-red-600 hover:bg-red-500 text-white rounded"
+                        >
+                          {setup2faLoading ? 'Disabling...' : 'Confirm Disable'}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Auto-Generated Safe WebDAV Credentials & Domain/IP Endpoint Card on Main App */}
+        <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-5 space-y-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Left: Safe WebDAV Credentials (Strictly same username as login, saved on SQLite) */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <KeyRound className="w-4 h-4 text-blue-400" />
+                  <h3 className="text-sm font-semibold text-zinc-100">
+                    WebDAV Credentials (Saved in SQLite)
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  disabled={regeneratingCreds}
+                  onClick={handleRegenerateWebdavCredentials}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-md hover:bg-blue-500 transition-colors shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${regeneratingCreds ? 'animate-spin' : ''}`} />
+                  Auto-Generate Safe Password
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* WebDAV Username (Same as Login Username) */}
+                <div className="p-2.5 bg-[#050507] border border-zinc-800 rounded-md space-y-1">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-500">
+                    <span>WebDAV Username</span>
+                    <span className="text-[10px] text-blue-400/90 font-mono">Same as Login</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-mono font-bold text-zinc-100 truncate">
+                      {state.account.username}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy('dav-user', state.account.username)}
+                      className="text-zinc-400 hover:text-white shrink-0"
+                      title="Copy WebDAV Username"
+                    >
+                      {copiedId === 'dav-user' ? (
+                        <Check className="w-3.5 h-3.5 text-blue-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Safe Auto-Generated WebDAV Password */}
+                <div className="p-2.5 bg-[#050507] border border-zinc-800 rounded-md space-y-1">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-500">
+                    <span>Safe Password (24 chars)</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowSafePassword((v) => !v)}
+                      className="text-zinc-400 hover:text-zinc-200 inline-flex items-center gap-1"
+                    >
+                      {showSafePassword ? (
+                        <EyeOff className="w-3 h-3" />
+                      ) : (
+                        <Eye className="w-3 h-3" />
+                      )}
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-mono text-blue-400 truncate select-all">
+                      {showSafePassword
+                        ? state.webdavCredentials.password
+                        : '••••••••••••••••••••••••'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy('dav-pass', state.webdavCredentials.password)}
+                      className="text-zinc-400 hover:text-white shrink-0"
+                      title="Copy Safe WebDAV Password"
+                    >
+                      {copiedId === 'dav-pass' ? (
+                        <Check className="w-3.5 h-3.5 text-blue-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-zinc-500 font-mono flex items-center gap-1.5 pt-0.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500 inline-block"></span>
+                <span>Stored in SQLite (<code>data/db/vaultdav.sqlite</code>) with AES-256-GCM encryption.</span>
+              </div>
+            </div>
+
+            {/* Right: Domain Name & IP Address WebDAV Access */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Globe className="w-4 h-4 text-blue-400" />
+                  <h3 className="text-sm font-semibold text-zinc-100">
+                    WebDAV Domain Name &amp; IP Address Access
+                  </h3>
+                </div>
+                <a
+                  href={activeMountPath}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-mono text-blue-400 hover:underline"
+                >
+                  Open {activeMountPath}
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-[#050507] border border-zinc-800 rounded-md text-xs font-mono">
+                  <span className="text-zinc-400 shrink-0">Domain URL:</span>
+                  <span className="text-zinc-100 truncate flex-1">{domainDavUrl}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy('dav-domain-url', domainDavUrl)}
+                    className="text-zinc-400 hover:text-white shrink-0"
+                    title="Copy Domain WebDAV URL"
+                  >
+                    {copiedId === 'dav-domain-url' ? (
+                      <Check className="w-3.5 h-3.5 text-blue-400" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                </div>
+
+                <form onSubmit={handleSaveWebdavHost} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Domain or IP (e.g. 192.168.1.50 or dav.example.com)"
+                    value={hostInput}
+                    onChange={(e) => setHostInput(e.target.value)}
+                    className="flex-1 px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Port"
+                    value={portInput}
+                    onChange={(e) => setPortInput(e.target.value)}
+                    className="w-20 px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    type="submit"
+                    disabled={savingHost}
+                    className="px-3 py-1.5 text-xs font-semibold bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md shrink-0"
+                  >
+                    {savingHost ? 'Saving...' : 'Save Host'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy('dav-ip-url', ipOrCustomDomainDavUrl)}
+                    className="px-2.5 py-1.5 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-blue-400 border border-zinc-800 rounded-md shrink-0 inline-flex items-center gap-1"
+                    title={ipOrCustomDomainDavUrl}
+                  >
+                    {copiedId === 'dav-ip-url' ? (
+                      <Check className="w-3.5 h-3.5 text-blue-400" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                    Copy IP/Host URL
+                  </button>
+                </form>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -1017,6 +1652,10 @@ export default function App() {
                 <h2 className="text-base font-semibold text-zinc-100">
                   WebDAV File Manager (/dav/{davMountSlug.toLowerCase()}/)
                 </h2>
+                <p className="text-xs font-mono text-zinc-400 mt-0.5">
+                  Endpoint: <span className="text-blue-400">{domainDavUrl}</span> ·{' '}
+                  <span className="text-zinc-300">{ipOrCustomDomainDavUrl}</span>
+                </p>
               </div>
 
               <div className="flex items-center gap-2">
@@ -1141,16 +1780,28 @@ export default function App() {
               </div>
             )}
 
-            {/* WebDAV Basic Auth Login Prompt */}
+            {/* WebDAV Basic Auth Login Prompt (Username is same as login, password is safe auto-generated password) */}
             {!davAuthed ? (
               <div className="p-8 flex justify-center">
                 <form
                   onSubmit={handleWebdavLogin}
                   className="max-w-sm w-full bg-[#050507] border border-zinc-800 rounded-lg p-6 space-y-4"
                 >
-                  <h3 className="text-base font-semibold text-zinc-100">
-                    Sign In to WebDAV
-                  </h3>
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-base font-semibold text-zinc-100">
+                      Sign In to WebDAV
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDavLoginUser(state.account.username);
+                        setDavLoginPass(state.webdavCredentials.password);
+                      }}
+                      className="text-xs font-mono text-blue-400 hover:underline"
+                    >
+                      Use SQLite Credentials
+                    </button>
+                  </div>
 
                   {davAuthError && (
                     <div className="p-2.5 bg-red-950/60 border border-red-800 rounded text-xs text-red-300">
@@ -1159,7 +1810,10 @@ export default function App() {
                   )}
 
                   <div>
-                    <label className="block text-xs text-zinc-300 mb-1">Username</label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-xs text-zinc-300">WebDAV Username</label>
+                      <span className="text-[10px] text-blue-400 font-mono">Same as Login</span>
+                    </div>
                     <input
                       type="text"
                       required
@@ -1170,12 +1824,14 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="block text-xs text-zinc-300 mb-1">Password</label>
+                    <label className="block text-xs text-zinc-300 mb-1">
+                      WebDAV Safe Password
+                    </label>
                     <input
                       type="password"
                       required
                       autoFocus
-                      placeholder="••••••••••••"
+                      placeholder="••••••••••••••••••••••••"
                       value={davLoginPass}
                       onChange={(e) => setDavLoginPass(e.target.value)}
                       className="w-full px-3 py-2 text-xs font-mono bg-[#0c0d10] border border-zinc-800 rounded text-zinc-100 focus:outline-none focus:border-blue-500"
@@ -1186,7 +1842,7 @@ export default function App() {
                     type="submit"
                     className="w-full py-2 px-4 text-xs font-semibold bg-blue-600 text-white rounded hover:bg-blue-500"
                   >
-                    Sign In
+                    Connect to WebDAV
                   </button>
                 </form>
               </div>
@@ -1442,14 +2098,41 @@ export default function App() {
         )}
 
         {/* ===================================================================
-            TAB 4: DOCKER COMPOSE & RELATED FILES VIEWER
+            TAB 4: DOCKER COMPOSE & READY-TO-RUN ZIP PACKAGE
            =================================================================== */}
         {activeTab === 'docker' && (
-          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-zinc-800/80">
+          <section className="bg-[#0c0d10] border border-zinc-800/80 rounded-lg p-6 space-y-5">
+            {/* Download Docker ZIP Banner */}
+            <div className="p-4 bg-[#050507] border border-zinc-800 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Archive className="w-4 h-4 text-blue-400" />
+                  <h3 className="text-sm font-semibold text-zinc-100">
+                    Ready-to-Run Docker Compose ZIP Archive
+                  </h3>
+                </div>
+                <p className="text-xs text-zinc-400">
+                  Includes pre-configured <code className="font-mono text-zinc-200">docker-compose.yml</code>, <code className="font-mono text-zinc-200">.env</code>, <code className="font-mono text-zinc-200">Dockerfile</code>, source code, and host volume structure.
+                </p>
+                <div className="text-[11px] font-mono text-zinc-500 pt-1">
+                  Run command: <code className="text-blue-400">unzip vaultdav-docker-compose.zip && cd vaultdav-docker-compose && docker compose up -d</code>
+                </div>
+              </div>
+
+              <button
+                onClick={handleDownloadDockerZip}
+                disabled={downloadingZip}
+                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors whitespace-nowrap shrink-0 shadow-sm"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {downloadingZip ? 'Generating ZIP...' : 'Download Docker ZIP'}
+              </button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b border-zinc-800/80">
               <div>
-                <h2 className="text-base font-semibold text-zinc-100">
-                  Docker Compose Files
+                <h2 className="text-sm font-semibold text-zinc-100">
+                  Individual Compose Stack Files
                 </h2>
               </div>
 
@@ -1505,16 +2188,11 @@ export default function App() {
                   className="inline-flex items-center gap-1.5 text-zinc-300 hover:text-white"
                 >
                   {copiedId === 'docker-file' ? (
-                    <>
-                      <Check className="w-3.5 h-3.5 text-blue-400" />
-                      Copied
-                    </>
+                    <Check className="w-3.5 h-3.5 text-blue-400" />
                   ) : (
-                    <>
-                      <Copy className="w-3.5 h-3.5" />
-                      Copy File
-                    </>
+                    <Copy className="w-3.5 h-3.5" />
                   )}
+                  Copy
                 </button>
                 <button
                   onClick={() =>
@@ -1526,12 +2204,12 @@ export default function App() {
                   className="inline-flex items-center gap-1.5 text-blue-400 hover:text-blue-300"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  Download {activeDockerFile.filename}
+                  Download File
                 </button>
               </div>
             </div>
 
-            <pre className="p-4 bg-[#050507] border border-zinc-800 text-zinc-200 rounded-lg text-xs font-mono overflow-x-auto max-h-[480px] leading-relaxed">
+            <pre className="p-4 bg-[#050507] border border-zinc-800 rounded-lg text-xs font-mono text-zinc-200 overflow-x-auto max-h-[480px] leading-relaxed">
               {activeDockerFile.content}
             </pre>
           </section>

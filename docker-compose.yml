@@ -15,6 +15,7 @@ services:
       - .env
     environment:
       - ENCRYPT_BRIDGED_FILES=false
+      - WEBDAV_HOST=${WEBDAV_HOST:-0.0.0.0}
     volumes:
       - ./data/db:/data/db
       # Host Folders Exposed via .env (Unencrypted on disk)

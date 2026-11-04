@@ -14,19 +14,42 @@ export interface EnvFolderMount {
 
 export interface SingleAccountInfo {
   id: number;
-  username: string;
+  username: string; // Same username used for both app login and WebDAV
   ciphertext_hex: string;
   iv_hex: string;
   auth_tag_hex: string;
+  totp_ciphertext_hex: string;
+  totp_iv_hex: string;
+  totp_auth_tag_hex: string;
+  totp_enabled: number | boolean;
+  webdav_ciphertext_hex: string;
+  webdav_iv_hex: string;
+  webdav_auth_tag_hex: string;
   kdf_spec: string;
   created_at: string;
   last_used_at: string | null;
+}
+
+export interface WebdavCredentialsInfo {
+  username: string; // Strictly identical to the login username
+  password: string; // Auto-generated safe password (stored encrypted in SQLite)
+  ciphertext_hex: string;
+  iv_hex: string;
+  auth_tag_hex: string;
+}
+
+export interface WebdavHostConfig {
+  domainOrIp: string;
+  port: string;
+  detectedIp: string;
+  detectedHost: string;
 }
 
 export interface AuthStatusResponse {
   hasAccount: boolean;
   authenticated: boolean;
   username: string | null;
+  totpEnabled: boolean;
 }
 
 export interface WebdavCustomHeader {
@@ -68,6 +91,8 @@ export interface WebdavEntry {
 
 export interface AppStateResponse {
   account: SingleAccountInfo;
+  webdavCredentials: WebdavCredentialsInfo;
+  webdavHostConfig: WebdavHostConfig;
   sqliteTables: string[];
   folders: EnvFolderMount[];
   customHeaders: WebdavCustomHeader[];
