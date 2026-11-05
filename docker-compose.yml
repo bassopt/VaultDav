@@ -9,16 +9,17 @@ services:
       dockerfile: Dockerfile
     container_name: vaultdav-server
     restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "${WEB_APP_PORT:-8080}:3000"
-      - "${WEBDAV_PORT:-8081}:3001"
     env_file:
       - .env
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - ENCRYPT_BRIDGED_FILES=false
       - WEBDAV_HOST=${WEBDAV_HOST:-0.0.0.0}
       - WEB_APP_PORT=${WEB_APP_PORT:-8080}
-      - WEBDAV_PORT=${WEBDAV_PORT:-8081}
       - SQLITE_DB_PATH=/data/db/vaultdav.sqlite
       - HOST_VOLUMES_DIR=/var/webdav
       - SYNCTHING_URL=http://syncthing:8384

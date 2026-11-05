@@ -40,19 +40,64 @@ fs.mkdirSync(HOST_VOLUMES_DIR, { recursive: true });
 fs.mkdirSync(SYNCTHING_CONFIG_DIR, { recursive: true });
 fs.mkdirSync(RUNTIME_SYNCTHING_DIR, { recursive: true });
 
-// Ensure default host volume subfolders
-const initialSubfolders = ['documents', 'projects', 'media', 'photos', 'backups'];
-for (const sub of initialSubfolders) {
-  const p = path.join(HOST_VOLUMES_DIR, sub);
-  fs.mkdirSync(p, { recursive: true });
-  const readmePath = path.join(p, `${sub}-readme.md`);
-  if (!fs.existsSync(readmePath)) {
-    fs.writeFileSync(
-      readmePath,
-      `# ${sub.toUpperCase()} Folder\n\nShared unencrypted inside \`./host_volumes/${sub}\` and bridged between WebDAV and Syncthing.\n`,
-      'utf8'
-    );
+// Shared UID and GID for WebDAV & Syncthing (defaults to 1000:1000)
+const TARGET_UID = Number(process.env.PUID || 1000);
+const TARGET_GID = Number(process.env.PGID || 1000);
+
+try {
+  // Ensure permissive umask (002) so files/directories created are group-writable by Syncthing
+  process.umask(0o002);
+} catch {}
+
+function applyUidGid(targetPath: string) {
+  try {
+    if (process.getuid && process.getuid() === 0 && fs.existsSync(targetPath)) {
+      fs.chownSync(targetPath, TARGET_UID, TARGET_GID);
+    }
+  } catch {}
+}
+
+function safeMkdirSync(targetPath: string) {
+  fs.mkdirSync(targetPath, { recursive: true });
+  let cur = path.resolve(targetPath);
+  const rootResolved = path.resolve(HOST_VOLUMES_DIR);
+  while (cur.startsWith(rootResolved)) {
+    applyUidGid(cur);
+    if (cur === rootResolved) break;
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
   }
+}
+applyUidGid(HOST_VOLUMES_DIR);
+
+function safeWriteFileSync(targetPath: string, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) {
+  fs.writeFileSync(targetPath, data, options);
+  applyUidGid(targetPath);
+}
+
+function safeRenameSync(oldPath: string, newPath: string) {
+  fs.renameSync(oldPath, newPath);
+  applyUidGid(newPath);
+}
+
+function safeCopySync(srcPath: string, destPath: string) {
+  fs.cpSync(srcPath, destPath, { recursive: true });
+  try {
+    if (process.getuid && process.getuid() === 0 && fs.existsSync(destPath)) {
+      const applyRec = (p: string) => {
+        try {
+          fs.chownSync(p, TARGET_UID, TARGET_GID);
+          if (fs.statSync(p).isDirectory()) {
+            for (const item of fs.readdirSync(p)) {
+              applyRec(path.join(p, item));
+            }
+          }
+        } catch {}
+      };
+      applyRec(destPath);
+    }
+  } catch {}
 }
 
 // ============================================================================
@@ -331,7 +376,7 @@ function parseStackEnv(): {
   headers: CustomHeaderItem[];
   webdavHost: string;
   webAppPort: string;
-  webdavPort: string;
+  port: string;
 } {
   let raw = '';
   if (fs.existsSync(ENV_STACK_FILE)) {
@@ -370,22 +415,19 @@ function parseStackEnv(): {
 
   const rawHost = map['WEBDAV_HOST'] || getDetectedLocalIp();
   const webdavHost = rawHost.startsWith('169.254.') ? '0.0.0.0' : rawHost;
-  const webAppPort = map['WEB_APP_PORT'] || '8080';
-  const webdavPort = map['WEBDAV_PORT'] || map['PORT'] || '8081';
+  const webAppPort = map['WEB_APP_PORT'] || map['PORT'] || '8080';
 
-  return { headers, webdavHost, webAppPort, webdavPort };
+  return { headers, webdavHost, webAppPort, port: webAppPort };
 }
 
 function writeStackEnv(
   headers: CustomHeaderItem[],
   webdavHost?: string,
-  webAppPort?: string,
-  webdavPort?: string
+  webAppPort?: string
 ) {
   const current = parseStackEnv();
   const finalHost = webdavHost !== undefined ? webdavHost : current.webdavHost;
   const finalWebAppPort = webAppPort !== undefined ? webAppPort : current.webAppPort;
-  const finalWebdavPort = webdavPort !== undefined ? webdavPort : current.webdavPort;
 
   const serializedHeaders = headers
     .map((h) => `${h.header_name}:${h.header_value}|${h.enabled ? '1' : '0'}`)
@@ -397,9 +439,8 @@ function writeStackEnv(
     'PGID=1000',
     'TZ=UTC',
     '',
-    '# Dedicated Host Ports (Different ports for Web App and WebDAV)',
+    '# Host Port for VaultDAV Web App & WebDAV service (/dav)',
     `WEB_APP_PORT=${finalWebAppPort}`,
-    `WEBDAV_PORT=${finalWebdavPort}`,
     'SYNCTHING_GUI_PORT=8384',
     'SYNCTHING_SYNC_PORT=22000',
     '',
@@ -575,8 +616,8 @@ function startLocalSyncthingDaemon() {
 }
 
 function generateStackArtifacts() {
-  const { headers, webdavHost, webAppPort, webdavPort } = parseStackEnv();
-  const envContent = writeStackEnv(headers, webdavHost, webAppPort, webdavPort);
+  const { headers, webdavHost, webAppPort } = parseStackEnv();
+  const envContent = writeStackEnv(headers, webdavHost, webAppPort);
 
   const composeContent = `# Docker Compose — VaultDAV + Syncthing Stack
 # SQLite (/data/db/vaultdav.sqlite) is used strictly for encrypted credentials.
@@ -589,16 +630,17 @@ services:
       dockerfile: Dockerfile
     container_name: vaultdav-server
     restart: unless-stopped
+    user: "\${PUID:-1000}:\${PGID:-1000}"
     ports:
       - "\${WEB_APP_PORT:-8080}:3000"
-      - "\${WEBDAV_PORT:-8081}:3001"
     env_file:
       - .env
     environment:
+      - PUID=\${PUID:-1000}
+      - PGID=\${PGID:-1000}
       - ENCRYPT_BRIDGED_FILES=false
       - WEBDAV_HOST=\${WEBDAV_HOST:-0.0.0.0}
       - WEB_APP_PORT=\${WEB_APP_PORT:-8080}
-      - WEBDAV_PORT=\${WEBDAV_PORT:-8081}
       - SQLITE_DB_PATH=/data/db/vaultdav.sqlite
       - HOST_VOLUMES_DIR=/var/webdav
       - SYNCTHING_URL=http://syncthing:8384
@@ -650,11 +692,12 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-# Create persistent directories for SQLite database and single host_volumes mount
-RUN mkdir -p /data/db /var/webdav
+# Create default directories for SQLite, single host_volumes mount, and runtimes with full write permissions
+RUN mkdir -p /data/db /var/webdav /tmp/vaultdav-syncthing-runtime \\
+    && chmod -R 777 /data /var/webdav /tmp/vaultdav-syncthing-runtime /app
 
-# Expose Web App (3000) and dedicated WebDAV Server (3001)
-EXPOSE 3000 3001
+# Expose Web App and WebDAV (/dav) on port 3000
+EXPOSE 3000
 
 CMD ["npm", "run", "start"]
 `;
@@ -681,7 +724,7 @@ function addDirectoryToZip(zip: JSZip, fsDirPath: string, zipDirPath: string) {
 async function createDockerComposeZipBuffer(): Promise<Buffer> {
   const zip = new JSZip();
   const artifacts = generateStackArtifacts();
-  const { webdavHost, webAppPort, webdavPort } = parseStackEnv();
+  const { webdavHost, webAppPort } = parseStackEnv();
 
   // Root stack orchestration files (prefer current files on disk to preserve any manual edits)
   const composePath = path.join(__dirname, 'docker-compose.yml');
@@ -725,8 +768,9 @@ async function createDockerComposeZipBuffer(): Promise<Buffer> {
   zip.folder('data/db');
   zip.file('data/db/.gitkeep', '# SQLite credential database directory\n');
 
-  // Include ./host_volumes
-  addDirectoryToZip(zip, HOST_VOLUMES_DIR, 'host_volumes');
+  // Clean ./host_volumes directory (never includes example folders)
+  zip.folder('host_volumes');
+  zip.file('host_volumes/.gitkeep', '# Mount point for host volumes\n');
 
   const readme = `# VaultDAV + Syncthing Docker Compose Package
 
@@ -747,17 +791,16 @@ docker compose up -d --build
 
 - **VaultDAV Web App & Admin Dashboard (Port ${webAppPort})**:
   - Web UI: http://localhost:${webAppPort} (or http://${webdavHost}:${webAppPort})
-- **Dedicated RFC 4918 WebDAV Server (Port ${webdavPort})**:
-  - WebDAV Root Endpoint: http://localhost:${webdavPort}/ (or http://${webdavHost}:${webdavPort}/)
-  - Also compatible at: http://localhost:${webdavPort}/dav/
+- **RFC 4918 WebDAV Service**:
+  - WebDAV Endpoint: http://localhost:${webAppPort}/dav/ (or http://${webdavHost}:${webAppPort}/dav/)
 - **Native Syncthing Web GUI**:
   - Web UI: http://localhost:8384
   - Synchronization Port: 22000 (TCP/UDP)
 
 ## Architecture
 
-1. **Single \`./host_volumes\` Mount**:
-   \`docker-compose.yml\` and \`.env\` only expose the single \`./host_volumes\` parent folder (\`/var/webdav\` inside both containers). All subfolders (\`documents\`, \`projects\`, \`media\`, \`photos\`, \`backups\`, etc.) live inside \`./host_volumes\`.
+1. **Single \`./host_volumes\` Mount & Shared UID/GID**:
+   \`docker-compose.yml\` and \`.env\` configure \`user: "\${PUID:-1000}:\${PGID:-1000}"\` so folders and files created via WebDAV share the host user's UID and GID without root ownership. No example folders are pre-created.
 2. **SQLite Used Strictly for Encrypted Credentials**:
    Account passwords, optional TOTP secret, and auto-generated safe WebDAV passwords are stored in \`./data/db/vaultdav.sqlite\` encrypted with AES-256-GCM.
 3. **Unified Username**:
@@ -1240,19 +1283,20 @@ async function startServer() {
         res.status(405).send('Cannot overwrite root collection');
         return;
       }
-      fs.mkdirSync(path.dirname(fsPath), { recursive: true });
+      safeMkdirSync(path.dirname(fsPath));
       const fileAlreadyExists = fs.existsSync(fsPath);
 
       if (Buffer.isBuffer(req.body)) {
-        fs.writeFileSync(fsPath, req.body);
+        safeWriteFileSync(fsPath, req.body);
       } else if (typeof req.body === 'string') {
-        fs.writeFileSync(fsPath, req.body, 'utf8');
+        safeWriteFileSync(fsPath, req.body, 'utf8');
       } else if (req.body && typeof req.body === 'object' && !('pipe' in req.body)) {
-        fs.writeFileSync(fsPath, JSON.stringify(req.body, null, 2), 'utf8');
+        safeWriteFileSync(fsPath, JSON.stringify(req.body, null, 2), 'utf8');
       } else if (typeof (req as any).pipe === 'function' && !req.readableEnded) {
         const out = fs.createWriteStream(fsPath);
         req.pipe(out);
         out.on('finish', () => {
+          applyUidGid(fsPath);
           const finalStat = fs.statSync(fsPath);
           res.setHeader('ETag', `"${finalStat.size.toString(16)}-${finalStat.mtimeMs.toString(16)}"`);
           res.status(fileAlreadyExists ? 204 : 201).end();
@@ -1262,7 +1306,7 @@ async function startServer() {
         });
         return;
       } else {
-        fs.writeFileSync(fsPath, Buffer.alloc(0));
+        safeWriteFileSync(fsPath, Buffer.alloc(0));
       }
 
       const finalStat = fs.statSync(fsPath);
@@ -1277,7 +1321,7 @@ async function startServer() {
         res.status(405).send('Collection already exists');
         return;
       }
-      fs.mkdirSync(fsPath, { recursive: true });
+      safeMkdirSync(fsPath);
       res.status(201).send('Created');
       return;
     }
@@ -1324,16 +1368,16 @@ async function startServer() {
         return;
       }
 
-      fs.mkdirSync(path.dirname(dest.fsPath), { recursive: true });
+      safeMkdirSync(path.dirname(dest.fsPath));
       if (destExists) {
         fs.rmSync(dest.fsPath, { recursive: true, force: true });
       }
 
       try {
-        fs.renameSync(fsPath, dest.fsPath);
+        safeRenameSync(fsPath, dest.fsPath);
       } catch (e: any) {
         if (e.code === 'EXDEV') {
-          fs.cpSync(fsPath, dest.fsPath, { recursive: true });
+          safeCopySync(fsPath, dest.fsPath);
           fs.rmSync(fsPath, { recursive: true, force: true });
         } else {
           res.status(500).send('Move failed: ' + e.message);
@@ -1368,12 +1412,12 @@ async function startServer() {
         return;
       }
 
-      fs.mkdirSync(path.dirname(dest.fsPath), { recursive: true });
+      safeMkdirSync(path.dirname(dest.fsPath));
       if (destExists) {
         fs.rmSync(dest.fsPath, { recursive: true, force: true });
       }
 
-      fs.cpSync(fsPath, dest.fsPath, { recursive: true });
+      safeCopySync(fsPath, dest.fsPath);
       res.status(destExists ? 204 : 201).end();
       return;
     }
@@ -1393,8 +1437,8 @@ async function startServer() {
 
       const status = fs.existsSync(fsPath) ? 200 : 201;
       if (!fs.existsSync(fsPath)) {
-        fs.mkdirSync(path.dirname(fsPath), { recursive: true });
-        fs.writeFileSync(fsPath, Buffer.alloc(0));
+        safeMkdirSync(path.dirname(fsPath));
+        safeWriteFileSync(fsPath, Buffer.alloc(0));
       }
       res.status(status).send(lockXml);
       return;
@@ -1446,7 +1490,7 @@ async function startServer() {
     }
 
     const folders = readHostVolumesItems();
-    const { headers, webdavHost, webAppPort, webdavPort } = parseStackEnv();
+    const { headers, webdavHost, webAppPort } = parseStackEnv();
     const artifacts = generateStackArtifacts();
     const detectedIp = getDetectedLocalIp();
     const detectedHost = String(req.headers.host || `${detectedIp}:3000`);
@@ -1462,9 +1506,9 @@ async function startServer() {
       },
       webdavHostConfig: {
         domainOrIp: webdavHost,
-        port: webdavPort,
+        port: webAppPort,
         webAppPort,
-        webdavPort,
+        webdavPort: webAppPort,
         detectedIp,
         detectedHost,
       },
@@ -1584,11 +1628,10 @@ async function startServer() {
 
   app.put('/api/webdav-host', async (req: Request, res: Response) => {
     const domainOrIp = String(req.body?.domainOrIp || '').trim() || getDetectedLocalIp();
-    const webAppPort = String(req.body?.webAppPort || '8080').trim() || '8080';
-    const webdavPort = String(req.body?.webdavPort || req.body?.port || '8081').trim() || '8081';
+    const webAppPort = String(req.body?.webAppPort || req.body?.port || '8080').trim() || '8080';
     const { headers } = parseStackEnv();
-    writeStackEnv(headers, domainOrIp, webAppPort, webdavPort);
-    res.json({ ok: true, domainOrIp, webAppPort, webdavPort });
+    writeStackEnv(headers, domainOrIp, webAppPort);
+    res.json({ ok: true, domainOrIp, webAppPort, port: webAppPort });
   });
 
   // Host folder operations inside ./host_volumes
@@ -1600,7 +1643,7 @@ async function startServer() {
       return;
     }
     const targetDir = path.join(HOST_VOLUMES_DIR, cleanName);
-    fs.mkdirSync(targetDir, { recursive: true });
+    safeMkdirSync(targetDir);
     res.status(201).json({ ok: true, name: cleanName });
   });
 
@@ -1681,19 +1724,10 @@ async function startServer() {
     });
   }
 
-  // 1. Dedicated RFC 4918 WebDAV Server listening on port 3001 (mapped to WEBDAV_PORT on host)
-  const WEBDAV_INTERNAL_PORT = 3001;
-  const davServerApp = express();
-  davServerApp.use(express.raw({ type: '*/*', limit: '500mb' }));
-  davServerApp.all('*', handleWebdavRequest);
-  davServerApp.listen(WEBDAV_INTERNAL_PORT, '0.0.0.0', () => {
-    console.log(`Dedicated WebDAV Server listening on http://0.0.0.0:${WEBDAV_INTERNAL_PORT}`);
-  });
-
-  // 2. Main VaultDAV Web App & Admin Dashboard on port 3000 (mapped to WEB_APP_PORT on host)
+  // Main VaultDAV Server on port 3000 (serves Web UI, API, and RFC 4918 WebDAV at /dav)
   const PORT = 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`VaultDAV Web App listening on http://0.0.0.0:${PORT}`);
+    console.log(`VaultDAV server listening on http://0.0.0.0:${PORT} (Web UI at /, WebDAV at /dav)`);
     // Pre-generate static zip archive for instant docker-compose download
     createDockerComposeZipBuffer().catch((err) => {
       console.warn('Initial docker-compose.zip generation error:', err);

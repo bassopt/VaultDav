@@ -108,8 +108,7 @@ export default function App() {
   const [showSafePassword, setShowSafePassword] = useState<boolean>(true);
   const [regeneratingCreds, setRegeneratingCreds] = useState<boolean>(false);
   const [hostInput, setHostInput] = useState<string>('');
-  const [webAppPortInput, setWebAppPortInput] = useState<string>('8080');
-  const [portInput, setPortInput] = useState<string>('8081');
+  const [portInput, setPortInput] = useState<string>('8080');
   const [savingHost, setSavingHost] = useState<boolean>(false);
   const [downloadingZip, setDownloadingZip] = useState<boolean>(false);
 
@@ -210,8 +209,7 @@ export default function App() {
           setDavLoginUser(data.account.username);
           setDavLoginPass((prev) => prev || data.webdavCredentials.password);
           setHostInput((prev) => prev || data.webdavHostConfig.domainOrIp);
-          setWebAppPortInput((prev) => prev || data.webdavHostConfig.webAppPort || '8080');
-          setPortInput((prev) => prev || data.webdavHostConfig.webdavPort || data.webdavHostConfig.port || '8081');
+          setPortInput((prev) => prev || data.webdavHostConfig.webAppPort || data.webdavHostConfig.port || '8080');
           const firstExposed = data.folders.find((f) => f.exposed);
           if (firstExposed) {
             setDavMountSlug((prev) =>
@@ -419,8 +417,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           domainOrIp: hostInput.trim(),
-          webAppPort: webAppPortInput.trim() || '8080',
-          webdavPort: portInput.trim() || '8081',
+          webAppPort: portInput.trim() || '8080',
+          port: portInput.trim() || '8080',
         }),
       });
       if (res.ok) {
@@ -912,11 +910,10 @@ export default function App() {
   const activeMountPath = '/dav/';
   const domainDavUrl = `${browserOrigin}${activeMountPath}`;
   const configuredHost = state.webdavHostConfig.domainOrIp || state.webdavHostConfig.detectedIp;
-  const configuredWebAppPort = state.webdavHostConfig.webAppPort || '8080';
-  const configuredWebdavPort = state.webdavHostConfig.webdavPort || state.webdavHostConfig.port || '8081';
+  const configuredPort = state.webdavHostConfig.webAppPort || state.webdavHostConfig.port || '8080';
   const ipOrCustomDomainDavUrl = configuredHost.startsWith('http')
-    ? `${configuredHost.replace(/\/+$/, '')}/`
-    : `http://${configuredHost}:${configuredWebdavPort}/`;
+    ? `${configuredHost.replace(/\/+$/, '')}/dav/`
+    : `http://${configuredHost}:${configuredPort}/dav/`;
 
   const is2faActive = Boolean(state.account.totp_enabled);
 
@@ -1413,23 +1410,13 @@ export default function App() {
                       className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
                     />
                   </div>
-                  <div className="w-24">
-                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">WEBDAV PORT</label>
-                    <input
-                      type="text"
-                      placeholder="8081"
-                      value={portInput}
-                      onChange={(e) => setPortInput(e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
-                    />
-                  </div>
-                  <div className="w-24">
-                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">WEB APP PORT</label>
+                  <div className="w-28">
+                    <label className="block text-[10px] text-zinc-500 font-mono mb-1">PORT</label>
                     <input
                       type="text"
                       placeholder="8080"
-                      value={webAppPortInput}
-                      onChange={(e) => setWebAppPortInput(e.target.value)}
+                      value={portInput}
+                      onChange={(e) => setPortInput(e.target.value)}
                       className="w-full px-2.5 py-1.5 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 focus:outline-none focus:border-blue-500"
                     />
                   </div>
@@ -1439,7 +1426,7 @@ export default function App() {
                       disabled={savingHost}
                       className="px-3 py-1.5 text-xs font-semibold bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-800 rounded-md shrink-0"
                     >
-                      {savingHost ? 'Saving...' : 'Save Ports & Host'}
+                      {savingHost ? 'Saving...' : 'Save Host & Port'}
                     </button>
                     <button
                       type="button"
@@ -1532,7 +1519,7 @@ export default function App() {
                 <input
                   type="text"
                   required
-                  placeholder="New Folder Name inside ./host_volumes (e.g. documents, media, backups)"
+                  placeholder="New Folder Name inside ./host_volumes (e.g. my_files)"
                   value={newSlug}
                   onChange={(e) => setNewSlug(e.target.value)}
                   className="flex-1 px-3 py-2 text-xs font-mono bg-[#050507] border border-zinc-800 rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-blue-500"
